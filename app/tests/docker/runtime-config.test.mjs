@@ -31,7 +31,7 @@ function run(env = {}) {
   return { win, cfg: win.__CONFIG__, js, csp };
 }
 
-const directive = (csp, name) => (csp.match(new RegExp(`${name} ([^;]*)`)) || [])[1];
+const directive = (csp, name) => (csp.match(new RegExp(`${name} ([^;"]*)`)) || [])[1];
 
 describe('config.js', () => {
   it('writes empty defaults with Bedrock off', () => {
