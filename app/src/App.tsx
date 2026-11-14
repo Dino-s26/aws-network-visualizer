@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { ReactFlowProvider } from '@xyflow/react';
 import { TopBar } from './components/TopBar';
 import { FlowCanvas } from './components/FlowCanvas';
-import { ChatPanel } from './components/ChatPanel';
+import { config } from './utils/config';
+
+// Chat (and the Bedrock SDK) is only fetched when Bedrock is enabled
+const ChatPanel = lazy(() => import('./components/ChatPanel').then((m) => ({ default: m.ChatPanel })));
 import { ResiliencyScoreCard } from './components/ResiliencyScoreCard';
 import { GuidedTour, type GuidedTourHandle } from './components/GuidedTour';
 import { EmptyStateBanner } from './components/EmptyStateBanner';
@@ -275,7 +278,7 @@ export default function App() {
           </div>
 
           {/* Divider + Chat */}
-          {chatOpen && (
+          {config.bedrockEnabled && chatOpen && (
             <>
               {/* WAI-ARIA window-splitter pattern, same as the chat input's
                   resize handle: a focusable `separator` carrying aria-valuenow
@@ -298,7 +301,9 @@ export default function App() {
               />
               {/* eslint-enable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex */}
               <div className="flex-1 min-w-0" style={{ width: `${100 - dividerX}%` }}>
-                <ChatPanel />
+                <Suspense fallback={null}>
+                  <ChatPanel />
+                </Suspense>
               </div>
             </>
           )}

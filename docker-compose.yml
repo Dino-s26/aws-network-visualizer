@@ -1,0 +1,26 @@
+services:
+  nwv:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: aws-network-visualizer:dev
+    ports:
+      - "8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # All optional. Bedrock chat stays off unless enabled.
+      BEDROCK_ENABLED: "false"
+      # BEDROCK_MODEL_ID: global.anthropic.claude-opus-5
+      # BEDROCK_GUARDRAIL_ID: ""
+      # BEDROCK_GUARDRAIL_VERSION: DRAFT
+      # DEFAULT_REGION: us-east-1
+      # DEFAULT_SCENARIO: noResiliency
+      # APP_TITLE: AWS Network Visualizer
+      # SSO_BACKEND_URL: ""
+      # CSP_CONNECT_EXTRA: ""   # extra allowed origins, space separated
