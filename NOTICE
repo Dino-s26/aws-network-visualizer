@@ -1,0 +1,13 @@
+AWS Network Visualizer
+Copyright 2026 AWS Network Visualizer contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software derived from:
+
+  sample-network-resilience-agent
+  https://github.com/aws-samples/sample-network-resilience-agent
+  Copyright Amazon.com, Inc. or its affiliates.
+  Licensed under the MIT No Attribution License (MIT-0).
+  A pristine copy, including its license, is kept in
+  references/sample-network-resilience-agent/ for reference.
