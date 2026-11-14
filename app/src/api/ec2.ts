@@ -1,0 +1,407 @@
+import {
+  EC2Client,
+  DescribeVpcsCommand,
+  DescribeVpnGatewaysCommand,
+  DescribeVpnConnectionsCommand,
+  DescribeTransitGatewaysCommand,
+  DescribeTransitGatewayAttachmentsCommand,
+  DescribeTransitGatewayPeeringAttachmentsCommand,
+  DescribeVpcPeeringConnectionsCommand,
+  DescribeCustomerGatewaysCommand,
+  DescribeTransitGatewayRouteTablesCommand,
+  GetTransitGatewayRouteTablePropagationsCommand,
+  SearchTransitGatewayRoutesCommand,
+  DescribeRouteTablesCommand,
+  DescribeRegionsCommand,
+} from '@aws-sdk/client-ec2';
+import type { Vpc, VpnGateway, VpnConnection, TransitGateway, TransitGatewayAttachment, TransitGatewayPeeringAttachment, VpcPeeringConnection, CustomerGateway, TgwRouteTable, TgwRoute, TgwRouteTableWithRoutes, TgwRouteTablePropagation, VpcRouteTable, VpcRoute } from '../types/aws-resources';
+import { drainPages } from './paginate';
+import { createEc2Client } from './aws-client';
+import type { AwsCredentials } from '../types/aws-resources';
+import type { TopologyData } from '../types/topology';
+
+/**
+ * Page cap for the EC2 describe paginators. DescribeRouteTables returns up to
+ * 100 route tables per page, so 1000 pages allows ~100k route tables in one
+ * region — far beyond any real account (the default service quota is 200 per
+ * VPC) while still bounding an endpoint that never clears NextToken.
+ */
+const EC2_MAX_PAGES = 1000;
+
+import { tagsToRecord } from '../utils/aws-tags';
+
+export async function fetchEnabledRegions(client: EC2Client): Promise<string[]> {
+  // AllRegions defaults to false — returns only regions enabled for this
+  // account, so the multi-region sweep never touches opted-out regions.
+  const res = await client.send(new DescribeRegionsCommand({}));
+  return (res.Regions ?? []).map((r) => r.RegionName ?? '').filter(Boolean);
+}
+
+export async function fetchVpcs(client: EC2Client, region: string): Promise<Vpc[]> {
+  const res = await client.send(new DescribeVpcsCommand({}));
+  return (res.Vpcs ?? []).map((v) => ({
+    vpcId: v.VpcId ?? '',
+    cidrBlock: v.CidrBlock ?? '',
+    tags: tagsToRecord(v.Tags),
+    region,
+    state: v.State ?? '',
+  }));
+}
+
+export async function fetchVpnGateways(client: EC2Client): Promise<VpnGateway[]> {
+  const res = await client.send(
+    new DescribeVpnGatewaysCommand({
+      Filters: [{ Name: 'state', Values: ['available'] }],
+    })
+  );
+  return (res.VpnGateways ?? []).map((g) => ({
+    vpnGatewayId: g.VpnGatewayId ?? '',
+    vpcAttachments: (g.VpcAttachments ?? []).map((a) => ({
+      vpcId: a.VpcId ?? '',
+      state: a.State ?? '',
+    })),
+    type: g.Type ?? '',
+    amazonSideAsn: Number(g.AmazonSideAsn ?? 0),
+    state: g.State ?? '',
+    tags: tagsToRecord(g.Tags),
+  }));
+}
+
+export async function fetchTransitGateways(client: EC2Client): Promise<TransitGateway[]> {
+  const res = await client.send(new DescribeTransitGatewaysCommand({}));
+  return (res.TransitGateways ?? []).map((t) => ({
+    transitGatewayId: t.TransitGatewayId ?? '',
+    transitGatewayArn: t.TransitGatewayArn ?? '',
+    state: t.State ?? '',
+    ownerId: t.OwnerId ?? '',
+    description: t.Description ?? '',
+    amazonSideAsn: Number(t.Options?.AmazonSideAsn ?? 0),
+    tags: tagsToRecord(t.Tags),
+  }));
+}
+
+export async function fetchTransitGatewayAttachments(
+  client: EC2Client
+): Promise<TransitGatewayAttachment[]> {
+  const res = await client.send(new DescribeTransitGatewayAttachmentsCommand({}));
+  return (res.TransitGatewayAttachments ?? []).map((a) => {
+    const tags = tagsToRecord(a.Tags);
+    return {
+      transitGatewayAttachmentId: a.TransitGatewayAttachmentId ?? '',
+      transitGatewayId: a.TransitGatewayId ?? '',
+      resourceType: (a.ResourceType ?? 'vpc') as TransitGatewayAttachment['resourceType'],
+      resourceId: a.ResourceId ?? '',
+      resourceOwnerId: a.ResourceOwnerId ?? '',
+      state: a.State ?? '',
+      name: tags.Name,
+      tags,
+    };
+  });
+}
+
+export async function fetchTransitGatewayPeeringAttachments(
+  client: EC2Client
+): Promise<TransitGatewayPeeringAttachment[]> {
+  const res = await client.send(new DescribeTransitGatewayPeeringAttachmentsCommand({}));
+  return (res.TransitGatewayPeeringAttachments ?? [])
+    .filter((p) => p.State !== 'deleted' && p.State !== 'deleting' && p.State !== 'failed' && p.State !== 'rejected')
+    .map((p) => ({
+      transitGatewayAttachmentId: p.TransitGatewayAttachmentId ?? '',
+      requesterTgwInfo: {
+        transitGatewayId: p.RequesterTgwInfo?.TransitGatewayId ?? '',
+        region: p.RequesterTgwInfo?.Region ?? '',
+        ownerId: p.RequesterTgwInfo?.OwnerId ?? '',
+      },
+      accepterTgwInfo: {
+        transitGatewayId: p.AccepterTgwInfo?.TransitGatewayId ?? '',
+        region: p.AccepterTgwInfo?.Region ?? '',
+        ownerId: p.AccepterTgwInfo?.OwnerId ?? '',
+      },
+      state: p.State ?? '',
+      tags: tagsToRecord(p.Tags),
+    }));
+}
+
+export async function fetchVpcPeeringConnections(
+  client: EC2Client,
+  region: string,
+): Promise<VpcPeeringConnection[]> {
+  const res = await client.send(new DescribeVpcPeeringConnectionsCommand({}));
+  return (res.VpcPeeringConnections ?? [])
+    .filter((p) => {
+      const s = p.Status?.Code ?? '';
+      return s !== 'deleted' && s !== 'deleting' && s !== 'failed' && s !== 'rejected' && s !== 'expired';
+    })
+    .map((p) => ({
+      vpcPeeringConnectionId: p.VpcPeeringConnectionId ?? '',
+      state: p.Status?.Code ?? '',
+      requesterVpc: {
+        vpcId: p.RequesterVpcInfo?.VpcId ?? '',
+        cidrBlock: p.RequesterVpcInfo?.CidrBlock ?? '',
+        ownerId: p.RequesterVpcInfo?.OwnerId ?? '',
+        region: p.RequesterVpcInfo?.Region ?? region,
+      },
+      accepterVpc: {
+        vpcId: p.AccepterVpcInfo?.VpcId ?? '',
+        cidrBlock: p.AccepterVpcInfo?.CidrBlock ?? '',
+        ownerId: p.AccepterVpcInfo?.OwnerId ?? '',
+        region: p.AccepterVpcInfo?.Region ?? region,
+      },
+      tags: tagsToRecord(p.Tags),
+    }));
+}
+
+export async function fetchCustomerGateways(client: EC2Client): Promise<CustomerGateway[]> {
+  const res = await client.send(new DescribeCustomerGatewaysCommand({}));
+  return (res.CustomerGateways ?? []).map((c) => ({
+    customerGatewayId: c.CustomerGatewayId ?? '',
+    bgpAsn: c.BgpAsn ?? '',
+    ipAddress: c.IpAddress ?? '',
+    state: c.State ?? '',
+    type: c.Type ?? '',
+    tags: tagsToRecord(c.Tags),
+  }));
+}
+
+export async function fetchVpnConnections(client: EC2Client): Promise<VpnConnection[]> {
+  const res = await client.send(new DescribeVpnConnectionsCommand({}));
+  return (res.VpnConnections ?? []).map((v) => {
+    const tunnelOptsByIp = new Map<string, { dpdTimeoutSeconds?: number; dpdTimeoutAction?: string }>();
+    for (const opt of v.Options?.TunnelOptions ?? []) {
+      if (!opt.OutsideIpAddress) continue;
+      tunnelOptsByIp.set(opt.OutsideIpAddress, {
+        dpdTimeoutSeconds: opt.DpdTimeoutSeconds,
+        dpdTimeoutAction: opt.DpdTimeoutAction,
+      });
+    }
+    return {
+      vpnConnectionId: v.VpnConnectionId ?? '',
+      vpnGatewayId: v.VpnGatewayId,
+      transitGatewayId: v.TransitGatewayId,
+      customerGatewayId: v.CustomerGatewayId ?? '',
+      state: v.State ?? '',
+      type: v.Type ?? '',
+      category: v.Category ?? '',
+      customerGatewayAddress: v.CustomerGatewayConfiguration ?? '',
+      tunnels: (v.VgwTelemetry ?? []).map((t) => {
+        const ip = t.OutsideIpAddress ?? '';
+        const opts = tunnelOptsByIp.get(ip);
+        return {
+          outsideIpAddress: ip,
+          status: (t.Status === 'UP' ? 'UP' : 'DOWN') as 'UP' | 'DOWN',
+          statusMessage: t.StatusMessage,
+          acceptedRouteCount: t.AcceptedRouteCount,
+          dpdTimeoutSeconds: opts?.dpdTimeoutSeconds,
+          dpdTimeoutAction: opts?.dpdTimeoutAction,
+          lastStatusChange: t.LastStatusChange?.toISOString(),
+        };
+      }),
+      staticRoutesOnly: v.Options?.StaticRoutesOnly,
+      tags: tagsToRecord(v.Tags),
+    };
+  });
+}
+
+export async function fetchTgwRouteTables(client: EC2Client, transitGatewayId: string): Promise<TgwRouteTable[]> {
+  const res = await client.send(new DescribeTransitGatewayRouteTablesCommand({
+    Filters: [{ Name: 'transit-gateway-id', Values: [transitGatewayId] }],
+  }));
+  return (res.TransitGatewayRouteTables ?? []).map((rt) => ({
+    transitGatewayRouteTableId: rt.TransitGatewayRouteTableId ?? '',
+    transitGatewayId: rt.TransitGatewayId ?? '',
+    state: rt.State ?? '',
+    defaultAssociationRouteTable: rt.DefaultAssociationRouteTable ?? false,
+    defaultPropagationRouteTable: rt.DefaultPropagationRouteTable ?? false,
+    tags: tagsToRecord(rt.Tags),
+  }));
+}
+
+export async function fetchTgwRoutes(client: EC2Client, routeTableId: string): Promise<TgwRoute[]> {
+  return (await fetchTgwRoutesWithTruncation(client, routeTableId)).routes;
+}
+
+/**
+ * `SearchTransitGatewayRoutes` has no page token: it returns up to `MaxResults`
+ * routes and sets `AdditionalRoutesAvailable` when it stopped short. Recorded so
+ * a prefix absent from a truncated table reads "unknown", not "not in the TGW".
+ */
+export async function fetchTgwRoutesWithTruncation(
+  client: EC2Client,
+  routeTableId: string,
+): Promise<{ routes: TgwRoute[]; truncated: boolean }> {
+  const res = await client.send(new SearchTransitGatewayRoutesCommand({
+    TransitGatewayRouteTableId: routeTableId,
+    Filters: [{ Name: 'state', Values: ['active', 'blackhole'] }],
+  }));
+  const truncated = res.AdditionalRoutesAvailable === true;
+  if (truncated) console.warn(`[AWS] SearchTransitGatewayRoutes(${routeTableId}) truncated — more routes exist than were returned`);
+  const routes = (res.Routes ?? []).map((r) => ({
+    destinationCidrBlock: r.DestinationCidrBlock ?? '',
+    transitGatewayAttachments: (r.TransitGatewayAttachments ?? []).map((a) => ({
+      transitGatewayAttachmentId: a.TransitGatewayAttachmentId ?? '',
+      resourceType: a.ResourceType ?? '',
+      resourceId: a.ResourceId ?? '',
+    })),
+    type: (r.Type === 'static' ? 'static' : 'propagated') as 'static' | 'propagated',
+    state: (r.State === 'blackhole' ? 'blackhole' : 'active') as 'active' | 'blackhole',
+  }));
+  return { routes, truncated };
+}
+
+/**
+ * Which attachments propagate routes INTO one TGW route table.
+ *
+ * Why this matters: SearchTransitGatewayRoutes shows what is in the table right
+ * now, which cannot distinguish "the table is empty because BGP is down" from
+ * "propagation was never enabled for this attachment". The second is the classic
+ * silent blackhole — the DX attachment looks healthy and the route table looks
+ * plausible, but traffic never moves on failover because nothing was ever
+ * propagating.
+ *
+ * Needs `ec2:GetTransitGatewayRouteTablePropagations`: a `Get*` action, so it is
+ * NOT covered by an `ec2:Describe*` wildcard. Callers must treat a thrown
+ * AccessDenied as "unknown", never as "no propagations".
+ *
+ * One call per route table, so this belongs on the on-demand path — not the
+ * login sweep.
+ */
+export async function fetchTgwRouteTablePropagations(
+  client: EC2Client,
+  routeTableId: string,
+): Promise<TgwRouteTablePropagation[]> {
+  return drainPages<TgwRouteTablePropagation>(
+    `TGW route table propagations for ${routeTableId}`,
+    async (nextToken) => {
+      const res = await client.send(new GetTransitGatewayRouteTablePropagationsCommand({
+        TransitGatewayRouteTableId: routeTableId,
+        NextToken: nextToken,
+      }));
+      const items = (res.TransitGatewayRouteTablePropagations ?? []).map((p) => ({
+        transitGatewayAttachmentId: p.TransitGatewayAttachmentId ?? '',
+        resourceId: p.ResourceId ?? '',
+        resourceType: p.ResourceType ?? '',
+        // Enum is disabled | disabling | enabled | enabling.
+        state: p.State ?? '',
+      }));
+      return { items, nextToken: res.NextToken };
+    },
+    { maxPages: EC2_MAX_PAGES },
+  );
+}
+
+export async function fetchVpcRouteTables(client: EC2Client): Promise<VpcRouteTable[]> {
+  // DescribeRouteTables returns every route table in the account+region in a
+  // single call (paginated). One trip handles all VPCs we care about.
+  return drainPages<VpcRouteTable>(
+    'VPC route tables',
+    async (nextToken) => {
+      const res = await client.send(new DescribeRouteTablesCommand({ NextToken: nextToken }));
+      const items = (res.RouteTables ?? []).map((rt) => {
+        const associations = rt.Associations ?? [];
+        const isMain = associations.some((a) => a.Main === true);
+        const associatedSubnetIds = associations
+          .map((a) => a.SubnetId)
+          .filter((s): s is string => Boolean(s));
+        const routes: VpcRoute[] = (rt.Routes ?? []).map((r) => ({
+          destinationCidrBlock: r.DestinationCidrBlock,
+          destinationIpv6CidrBlock: r.DestinationIpv6CidrBlock,
+          destinationPrefixListId: r.DestinationPrefixListId,
+          gatewayId: r.GatewayId,
+          natGatewayId: r.NatGatewayId,
+          transitGatewayId: r.TransitGatewayId,
+          vpcPeeringConnectionId: r.VpcPeeringConnectionId,
+          networkInterfaceId: r.NetworkInterfaceId,
+          egressOnlyInternetGatewayId: r.EgressOnlyInternetGatewayId,
+          carrierGatewayId: r.CarrierGatewayId,
+          localGatewayId: r.LocalGatewayId,
+          coreNetworkArn: r.CoreNetworkArn,
+          instanceId: r.InstanceId,
+          origin: r.Origin,
+          state: (r.State === 'blackhole' ? 'blackhole' : 'active') as 'active' | 'blackhole',
+        }));
+        return {
+          routeTableId: rt.RouteTableId ?? '',
+          vpcId: rt.VpcId ?? '',
+          isMain,
+          associatedSubnetIds,
+          tags: tagsToRecord(rt.Tags),
+          routes,
+        };
+      });
+      return { items, nextToken: res.NextToken };
+    },
+    { maxPages: EC2_MAX_PAGES },
+  );
+}
+
+/**
+ * `includePropagations` is opt-in and defaults to false: this function runs in
+ * the Phase 2 login sweep, where it already costs one call per route table, and
+ * `ec2:GetTransitGatewayRouteTablePropagations` is a Get* action most existing
+ * policies do not grant. A propagation failure degrades that table's
+ * `propagations` to `undefined` ("unknown") rather than failing the batch, so
+ * rules stay silent instead of reporting a blackhole from missing permission.
+ */
+export async function fetchTgwRouteTablesWithRoutes(
+  client: EC2Client,
+  transitGatewayId: string,
+  includePropagations = false,
+): Promise<TgwRouteTableWithRoutes[]> {
+  const routeTables = await fetchTgwRouteTables(client, transitGatewayId);
+  const results = await Promise.all(
+    routeTables.map(async (rt) => {
+      const [routes, propagations] = await Promise.all([
+        fetchTgwRoutesWithTruncation(client, rt.transitGatewayRouteTableId),
+        includePropagations
+          ? fetchTgwRouteTablePropagations(client, rt.transitGatewayRouteTableId).catch((err) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.warn(
+                `[AWS] TGWPropagations(${rt.transitGatewayRouteTableId}) FAILED:`,
+                msg,
+              );
+              return undefined;
+            })
+          : Promise.resolve(undefined),
+      ]);
+      return {
+        routeTable: rt,
+        routes: routes.routes,
+        propagations,
+        ...(routes.truncated ? { routesTruncated: true } : {}),
+      };
+    })
+  );
+  return results;
+}
+
+/**
+ * Re-read the route tables of this account's own Transit Gateways.
+ *
+ * Called together with the VIF route fetch so the two describe the same moment.
+ * The login sweep reads TGW route tables once; VIF routes are read later (Live, or
+ * report export), and on a flapping estate the two then disagree — a prefix the
+ * VIFs no longer carry still shows as installed, and the report graded it
+ * "Rejected" beside an Active via gateway. Only TGWs this account owns are
+ * refreshed (spoke-account tables need an assumed role and keep their login read).
+ * A TGW whose refresh fails keeps its previous tables rather than going blank.
+ */
+export async function refreshOwnTgwRouteTables(
+  creds: AwsCredentials,
+  topology: Pick<TopologyData, 'transitGateways' | 'tgwRouteTables' | 'homeAccountId'>,
+): Promise<TopologyData['tgwRouteTables']> {
+  const next = new Map(topology.tgwRouteTables);
+  const own = topology.transitGateways.filter((t) =>
+    topology.tgwRouteTables.has(t.transitGatewayId)
+    && (!topology.homeAccountId || t.ownerId === topology.homeAccountId));
+  await Promise.all(own.map(async (tgw) => {
+    // arn:aws:ec2:<region>:<account>:transit-gateway/<id>
+    const region = tgw.transitGatewayArn.split(':')[3] || creds.region;
+    try {
+      const tables = await fetchTgwRouteTablesWithRoutes(createEc2Client({ ...creds, region }), tgw.transitGatewayId, true);
+      if (tables.length > 0) next.set(tgw.transitGatewayId, tables);
+    } catch (err) {
+      console.warn(`[AWS] TGW route refresh(${tgw.transitGatewayId}) failed — keeping the login read:`, err instanceof Error ? err.message : String(err));
+    }
+  }));
+  return next;
+}

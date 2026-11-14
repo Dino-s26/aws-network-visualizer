@@ -1,0 +1,896 @@
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
+import type { ReactNode } from 'react';
+import { useTopologyStore } from '../store/topology-store';
+import { useIsLight } from '../hooks/useTheme';
+import { ISSUE_LOOKBACK_DAYS, NON_RESOURCE_ENTITY_VALUES } from '../api/health-dx';
+import type { DxMaintenanceEvent } from '../types/aws-resources';
+
+const MONTHS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+const MONTHS_SHORT = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+const WEEKDAYS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+const EMPTY_EVENTS: DxMaintenanceEvent[] = [];
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function startOfMonthUtc(year: number, month: number): Date {
+  return new Date(Date.UTC(year, month, 1));
+}
+
+function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+}
+
+function sameUtcDay(a: Date, b: Date): boolean {
+  return a.getUTCFullYear() === b.getUTCFullYear()
+    && a.getUTCMonth() === b.getUTCMonth()
+    && a.getUTCDate() === b.getUTCDate();
+}
+
+/**
+ * Is this an AWS-side problem rather than planned maintenance?
+ *
+ * The Health API returns two categories for Direct Connect and this panel shows
+ * both: `scheduledChange` (planned maintenance, forward-looking and still
+ * actionable) and `issue` (an AWS-side fault, usually already closed by the time
+ * we fetch it). They must never be presented interchangeably — labelling a past
+ * outage "planned maintenance" tells the customer the opposite of what happened.
+ *
+ * A missing category means the snapshot predates issue fetching, when
+ * `scheduledChange` was all the app requested — so absent reads as scheduled.
+ */
+function isIssue(e: DxMaintenanceEvent): boolean {
+  return e.eventTypeCategory === 'issue';
+}
+
+/** An event AWS still considers live — upcoming maintenance, or an open fault. */
+function isCurrent(e: DxMaintenanceEvent): boolean {
+  return e.statusCode === 'upcoming' || e.statusCode === 'open';
+}
+
+/**
+ * Is this event about a region where the account has no Direct Connect at all?
+ *
+ * `PUBLIC` events are AWS-wide announcements pushed to every account in every
+ * region, whether or not that account has anything there — so a Frankfurt DX
+ * fault lands in the calendar of an estate that has never had a Frankfurt
+ * presence, painted as a red day it can do nothing about and was never affected
+ * by. Those are the only ones worth dropping, and the guards matter:
+ *
+ *  - `ACCOUNT_SPECIFIC` always stays. AWS is asserting *this* account was hit, so
+ *    an unrecognised region means our topology is stale or that region's fetch
+ *    failed — not that the event is irrelevant. Hiding it would suppress a real,
+ *    AWS-confirmed impact on the strength of data we know can be incomplete.
+ *  - Unknown/missing scope stays, since snapshots predating `eventScopeCode`
+ *    cannot be classified and a guess either way would be wrong for some of them.
+ *  - An event with no region stays; there is nothing to compare.
+ */
+function isOffFootprint(e: DxMaintenanceEvent, dxRegions: ReadonlySet<string>): boolean {
+  return e.eventScopeCode === 'PUBLIC' && !!e.region && !dxRegions.has(e.region);
+}
+
+/** Does event `e` intersect the UTC day of `day`? */
+function eventHitsDay(e: DxMaintenanceEvent, day: Date): boolean {
+  if (!e.startTime) return false;
+  const start = new Date(e.startTime);
+  const end = e.endTime ? new Date(e.endTime) : start;
+  // Day window in UTC
+  const dayStart = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()));
+  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000 - 1);
+  return end >= dayStart && start <= dayEnd;
+}
+
+export function MaintenanceCalendar({ iconBtnClass }: { iconBtnClass: (active?: boolean) => string }) {
+  // IMPORTANT: select the underlying reference, not a fallback literal — using
+  // `?? []` here returns a new array each render and triggers Zustand's infinite
+  // re-render guard.
+  const rawEvents = useTopologyStore((s) => s.topologyData?.maintenanceEvents);
+  const allEvents: DxMaintenanceEvent[] = rawEvents ?? EMPTY_EVENTS;
+  // Same rule as rawEvents: select the underlying array references, never a
+  // derived array, or every render hands Zustand a new object.
+  const connections = useTopologyStore((s) => s.topologyData?.connections);
+  const virtualInterfaces = useTopologyStore((s) => s.topologyData?.virtualInterfaces);
+  const lags = useTopologyStore((s) => s.topologyData?.lags);
+  const currentNodes = useTopologyStore((s) => s.currentNodes);
+  const currentEdges = useTopologyStore((s) => s.currentEdges);
+  const setSpotlightNode = useTopologyStore((s) => s.setSpotlightNode);
+  const setSpotlightEdge = useTopologyStore((s) => s.setSpotlightEdge);
+  const light = useIsLight();
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Regions where this account actually terminates Direct Connect. Connections,
+  // VIFs and LAGs each carry their own region and none of the three is a superset
+  // of the others — a hosted-VIF account owns no connections at all, and a LAG
+  // can sit in a region whose VIFs failed to fetch.
+  const dxRegions = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of connections ?? []) if (c.region) set.add(c.region);
+    for (const v of virtualInterfaces ?? []) if (v.region) set.add(v.region);
+    for (const l of lags ?? []) if (l.region) set.add(l.region);
+    return set;
+  }, [connections, virtualInterfaces, lags]);
+
+  // Everything downstream — badge counts, day dots, next-activity jump, the
+  // details panel — reads `events`, so the filter applies once here rather than
+  // at each call site where one omission would put a dropped event back on screen.
+  //
+  // Split rather than filtered so what was dropped can still be reported. When we
+  // know of no DX regions at all — topology not loaded yet, or every regional fetch
+  // failed — filter nothing: an empty footprint is ignorance, not evidence, and
+  // treating it as evidence would blank the calendar off one failed call.
+  const { events, offFootprint } = useMemo(() => {
+    if (dxRegions.size === 0) {
+      return { events: allEvents, offFootprint: EMPTY_EVENTS };
+    }
+    const kept: DxMaintenanceEvent[] = [];
+    const dropped: DxMaintenanceEvent[] = [];
+    for (const e of allEvents) {
+      (isOffFootprint(e, dxRegions) ? dropped : kept).push(e);
+    }
+    return { events: kept, offFootprint: dropped };
+  }, [allEvents, dxRegions]);
+
+  // Dropped events get no UI at all — not a card, not a badge, not a footnote:
+  // an event in a region the account has nothing in is not a finding, and a
+  // control for reviewing non-findings is just clutter. But "no UI" must not mean
+  // unaccountable, or a wrong footprint call becomes undiagnosable, so the console
+  // keeps the record: it names the regions and is the first place to look when an
+  // event you expected is absent.
+  useEffect(() => {
+    if (offFootprint.length === 0) return;
+    const regions = Array.from(new Set(offFootprint.map((e) => e.region).filter(Boolean))).sort();
+    console.log(
+      `[Calendar] Hiding ${offFootprint.length} region-wide AWS event(s) — no Direct Connect resources in ${regions.join(', ')}`,
+    );
+  }, [offFootprint]);
+
+  // Resolve a raw AWS resource ID (dxcon-*, dxvif-*, dxgw-*) to either a graph
+  // node ID or an edge ID so hovering the chip can spotlight the matching
+  // element on the canvas. Both the maintenance target and the visual element
+  // must line up exactly — a wrong highlight is worse than no highlight, so we
+  // match on the ID's own prefix rather than a generic node/edge scan.
+  //  - dxvif-*: VIFs live on edges — spotlight the edge itself (the actual
+  //    maintenance target), not the DXGW/device it terminates on. Falls back to
+  //    the aggregated "N VIFs" edge that folded this VIF in.
+  //  - dxcon-*: the DX Connection is the EDGE between the Customer/Partner
+  //    Device and the AWS logical device. Spotlight that edge — NOT either
+  //    endpoint node. Both the partner device (customer gateway) and the AWS
+  //    device carry `resourceId === connectionId`, so a node scan would light up
+  //    the customer gateway, which is not the connection. Falls back to the AWS
+  //    device only when the connection edge isn't in the current view (e.g. the
+  //    partner devices collapsed into a group).
+  //  - dxgw-* / other: resolve to the node whose id or resourceId matches.
+  const resolveSpotlight = useCallback((resourceId: string): SpotlightTarget | null => {
+    if (resourceId.startsWith('dxvif-')) {
+      const byEdge = currentEdges.find((e) => e.data?.vifId === resourceId);
+      if (byEdge) return { kind: 'edge', id: byEdge.id };
+      // The VIF may have been folded into an aggregated "N VIFs" edge whose own
+      // vifId is a synthetic "N-vifs" marker — match the individual members.
+      const byAgg = currentEdges.find((e) =>
+        e.data?.aggregatedVifs?.some((v) => v.vifId === resourceId),
+      );
+      if (byAgg) return { kind: 'edge', id: byAgg.id };
+      return null;
+    }
+    if (resourceId.startsWith('dxcon-')) {
+      const byEdge = currentEdges.find((e) => e.data?.connectionId === resourceId);
+      if (byEdge) return { kind: 'edge', id: byEdge.id };
+      // Connection edge not rendered (collapsed partner group) — point at the
+      // AWS device terminating the connection, the AWS-side maintenance target.
+      const awsDev = currentNodes.find(
+        (n) => n.data?.category === 'awsDevice' && n.data?.resourceId === resourceId,
+      );
+      if (awsDev) return { kind: 'node', id: awsDev.id };
+      return null;
+    }
+    const byNode = currentNodes.find((n) => n.id === resourceId || n.data?.resourceId === resourceId);
+    if (byNode) return { kind: 'node', id: byNode.id };
+    return null;
+  }, [currentNodes, currentEdges]);
+
+  // Anchor the calendar on today's month so it opens on the user's current
+  // context — not jumping them straight into the future. A separate
+  // "next activity" control lets them fast-forward to the upcoming event.
+  const todayAnchor = useMemo(() => {
+    const now = new Date();
+    return { year: now.getUTCFullYear(), month: now.getUTCMonth() };
+  }, []);
+
+  const [viewYear, setViewYear] = useState(todayAnchor.year);
+  const [viewMonth, setViewMonth] = useState(todayAnchor.month);
+  const [selectedDay, setSelectedDay] = useState<Date | null>(null);
+
+  // Reset to today's month whenever the panel closes so reopening always
+  // lands on "now" rather than wherever the user last navigated. The month/day
+  // are user-navigable state that has to persist while the panel is open, so it
+  // can't be derived — instead we react to the open -> closed transition during
+  // render, which keeps the reopen instant (the panel never paints last month's
+  // grid first) without the cascading re-render an effect would cause.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (!open) {
+      setViewYear(todayAnchor.year);
+      setViewMonth(todayAnchor.month);
+      setSelectedDay(null);
+    }
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  // Hide entirely when there are no events — per user spec. Keyed on the filtered
+  // list, so an account whose only events are region-wide faults in regions it has
+  // no presence in gets no calendar at all rather than an empty one inviting a
+  // click. The console line above still records what was dropped.
+  if (events.length === 0) return null;
+
+  const firstDay = startOfMonthUtc(viewYear, viewMonth);
+  const offset = firstDay.getUTCDay(); // 0-6
+  const totalDays = daysInMonth(viewYear, viewMonth);
+  const today = new Date();
+
+  // Build calendar cells (null = blank leading cell)
+  const cells: (Date | null)[] = [];
+  for (let i = 0; i < offset; i++) cells.push(null);
+  for (let d = 1; d <= totalDays; d++) {
+    cells.push(new Date(Date.UTC(viewYear, viewMonth, d)));
+  }
+  // Pad to full weeks
+  while (cells.length % 7 !== 0) cells.push(null);
+
+  const selectedGroups = selectedDay
+    ? groupEventsByWindow(events.filter((e) => eventHitsDay(e, selectedDay)))
+    : [];
+
+  const goPrev = () => {
+    if (viewMonth === 0) { setViewMonth(11); setViewYear((y) => y - 1); }
+    else setViewMonth((m) => m - 1);
+  };
+  const goNext = () => {
+    if (viewMonth === 11) { setViewMonth(0); setViewYear((y) => y + 1); }
+    else setViewMonth((m) => m + 1);
+  };
+
+  // Find the next event start at/after the given instant. Used to jump
+  // forward from today, or from the currently selected day, to the next
+  // scheduled maintenance window.
+  //
+  // Scheduled changes only: `issue` events are AWS-side faults we fetch
+  // retrospectively, so a forward "next activity" jump would either never reach
+  // them or, worse, land on one and describe a past outage as upcoming work.
+  const nextEventAfter = (from: Date): Date | null => {
+    const threshold = from.getTime();
+    const upcoming = events
+      .filter((e) => !isIssue(e))
+      .map((e) => (e.startTime ? new Date(e.startTime) : null))
+      .filter((d): d is Date => !!d && d.getTime() >= threshold)
+      .sort((a, b) => a.getTime() - b.getTime());
+    return upcoming[0] ?? null;
+  };
+
+  // Anchor for the "jump" button: if the user has selected a day that
+  // already has an event, look for the next one *after* that day; otherwise
+  // look for the next event from today onwards.
+  const jumpFrom = selectedDay
+    ? new Date(selectedDay.getTime() + DAY_MS)
+    : new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const nextEvent = nextEventAfter(jumpFrom);
+
+  const jumpToNextEvent = () => {
+    if (!nextEvent) return;
+    setViewYear(nextEvent.getUTCFullYear());
+    setViewMonth(nextEvent.getUTCMonth());
+    setSelectedDay(new Date(Date.UTC(
+      nextEvent.getUTCFullYear(),
+      nextEvent.getUTCMonth(),
+      nextEvent.getUTCDate(),
+    )));
+  };
+
+  const goToday = () => {
+    setViewYear(today.getUTCFullYear());
+    setViewMonth(today.getUTCMonth());
+    setSelectedDay(null);
+  };
+
+  const viewIsCurrentMonth = viewYear === today.getUTCFullYear() && viewMonth === today.getUTCMonth();
+
+  // Counted separately: an open AWS fault and an upcoming maintenance window are
+  // different things to act on, and the badge used to pool them under the
+  // "Planned maintenance" label.
+  const upcomingCount = events.filter((e) => !isIssue(e) && isCurrent(e)).length;
+  const openIssueCount = events.filter((e) => isIssue(e) && isCurrent(e)).length;
+  const pastIssueCount = events.filter((e) => isIssue(e) && !isCurrent(e)).length;
+  const badgeCount = upcomingCount + openIssueCount;
+
+  // The panel carries both categories, so the trigger has to describe whichever
+  // it actually holds instead of always claiming planned maintenance.
+  const triggerLabel = (() => {
+    const parts: string[] = [];
+    if (upcomingCount > 0) parts.push(`${upcomingCount} planned maintenance`);
+    if (openIssueCount > 0) parts.push(`${openIssueCount} ongoing AWS issue${openIssueCount === 1 ? '' : 's'}`);
+    if (pastIssueCount > 0) parts.push(`${pastIssueCount} past AWS issue${pastIssueCount === 1 ? '' : 's'}`);
+    return parts.length > 0
+      ? `Direct Connect events — ${parts.join(', ')}`
+      : 'Direct Connect events';
+  })();
+
+  const daysUntilNext = nextEvent
+    ? Math.max(0, Math.round(
+        (Date.UTC(nextEvent.getUTCFullYear(), nextEvent.getUTCMonth(), nextEvent.getUTCDate())
+        - Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate())) / DAY_MS,
+      ))
+    : null;
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        data-tour="maintenance"
+        onClick={() => setOpen((v) => !v)}
+        className={iconBtnClass(open)}
+        title={triggerLabel}
+        aria-label="Direct Connect events calendar"
+        aria-expanded={open}
+      >
+        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+          <line x1="16" y1="2" x2="16" y2="6" />
+          <line x1="8" y1="2" x2="8" y2="6" />
+          <line x1="3" y1="10" x2="21" y2="10" />
+        </svg>
+        {badgeCount > 0 && (
+          <span
+            className={`absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full text-[9px] font-semibold leading-[14px] text-center ${
+              // An ongoing AWS fault outranks planned work: red, not amber.
+              openIssueCount > 0
+                ? 'bg-red-500 text-white'
+                : light ? 'bg-amber-500 text-white' : 'bg-amber-500 text-slate-900'
+            }`}
+            aria-hidden="true"
+          >
+            {badgeCount}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div
+          className={`absolute top-full right-0 mt-1 rounded-lg shadow-lg border z-50 w-[340px] ${
+            light
+              ? 'bg-white border-gray-200 shadow-gray-200/50'
+              : 'bg-slate-800 border-slate-700 shadow-black/40'
+          }`}
+        >
+          {/* Header */}
+          <div className={`flex items-center justify-between px-3 py-2 border-b ${light ? 'border-gray-100' : 'border-slate-700/60'}`}>
+            <button
+              onClick={goPrev}
+              className={`p-1 rounded transition-colors ${light ? 'hover:bg-gray-100 text-gray-600' : 'hover:bg-white/[0.06] text-slate-400'}`}
+              aria-label="Previous month"
+            >
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6" /></svg>
+            </button>
+            <div className={`text-[12px] font-semibold ${light ? 'text-gray-800' : 'text-slate-200'}`}>
+              {MONTHS[viewMonth]} {viewYear}
+            </div>
+            <button
+              onClick={goNext}
+              className={`p-1 rounded transition-colors ${light ? 'hover:bg-gray-100 text-gray-600' : 'hover:bg-white/[0.06] text-slate-400'}`}
+              aria-label="Next month"
+            >
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+            </button>
+          </div>
+
+          {/* Context banner: if the user has navigated away from the current
+              month, offer a quick return to today. Otherwise, surface the
+              next upcoming event. The two cases share the same "Go to"
+              pattern so the action is predictable wherever it appears. */}
+          {!viewIsCurrentMonth ? (
+            <button
+              onClick={goToday}
+              className={`w-full flex items-center justify-between gap-2 px-3 py-1.5 text-[11px] border-b transition-colors text-left ${
+                light
+                  ? 'bg-blue-50 hover:bg-blue-100 border-blue-100 text-blue-700'
+                  : 'bg-blue-500/10 hover:bg-blue-500/15 border-blue-500/20 text-blue-300'
+              }`}
+              aria-label="Return to current date"
+            >
+              <span className="inline-flex items-center gap-1.5 min-w-0">
+                <svg className="w-3 h-3 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="8" x2="12" y2="12" />
+                  <line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                <span className="truncate">
+                  Today: {MONTHS_SHORT[today.getUTCMonth()]} {today.getUTCDate()}, {today.getUTCFullYear()}
+                </span>
+              </span>
+              <span className="inline-flex items-center gap-0.5 font-medium flex-shrink-0">
+                Return to current date
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </span>
+            </button>
+          ) : nextEvent ? (
+            <button
+              onClick={jumpToNextEvent}
+              className={`w-full flex items-center justify-between gap-2 px-3 py-1.5 text-[11px] border-b transition-colors text-left ${
+                light
+                  ? 'bg-amber-50 hover:bg-amber-100 border-amber-100 text-amber-800'
+                  : 'bg-amber-500/10 hover:bg-amber-500/15 border-amber-500/20 text-amber-300'
+              }`}
+              aria-label={`Go to next maintenance on ${nextEvent.toUTCString().slice(0, 16)} UTC`}
+            >
+              <span className="inline-flex items-center gap-1.5 min-w-0">
+                <svg className="w-3 h-3 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10" />
+                  <polyline points="12 6 12 12 16 14" />
+                </svg>
+                <span className="truncate">
+                  Next Activity - {MONTHS_SHORT[nextEvent.getUTCMonth()]} {nextEvent.getUTCDate()}
+                  {daysUntilNext !== null && (
+                    <span className={light ? 'text-amber-600/80' : 'text-amber-300/70'}>
+                      {' '}· {daysUntilNext === 0 ? 'today' : daysUntilNext === 1 ? 'in 1 day' : `in ${daysUntilNext} days`}
+                    </span>
+                  )}
+                </span>
+              </span>
+              <span className="inline-flex items-center gap-0.5 font-medium flex-shrink-0">
+                Go to
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </span>
+            </button>
+          ) : null}
+
+          {/* Grid */}
+          <div className="px-3 pt-2 pb-3">
+            <div className={`grid grid-cols-7 gap-1 mb-1 text-center text-[9px] uppercase tracking-wide font-semibold ${light ? 'text-gray-400' : 'text-slate-500'}`}>
+              {WEEKDAYS.map((d, i) => <div key={i}>{d}</div>)}
+            </div>
+            <div className="grid grid-cols-7 gap-1">
+              {cells.map((day, i) => {
+                if (!day) return <div key={`blank-${i}`} className="h-8" />;
+                const isToday = sameUtcDay(day, today);
+                const dayEvents = events.filter((e) => eventHitsDay(e, day));
+                const hit = dayEvents.length > 0;
+                // A day carrying an AWS fault is styled and described as one even
+                // if maintenance also falls on it — the fault is the bigger news.
+                const dayHasIssue = dayEvents.some(isIssue);
+                const dayHasScheduled = dayEvents.some((e) => !isIssue(e));
+                const dayLabel = dayHasIssue && dayHasScheduled
+                  ? ' — AWS issue and planned maintenance'
+                  : dayHasIssue
+                    ? ' — AWS issue'
+                    : dayHasScheduled
+                      ? ' — planned maintenance'
+                      : '';
+                const isSelected = selectedDay && sameUtcDay(day, selectedDay);
+                const todayRing = isToday && !isSelected
+                  ? light
+                    ? 'ring-1 ring-blue-400'
+                    : 'ring-1 ring-blue-400/70'
+                  : '';
+                return (
+                  <button
+                    key={day.toISOString()}
+                    onClick={() => setSelectedDay(day)}
+                    className={`relative h-8 rounded text-[11px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${todayRing} ${
+                      isSelected
+                        ? 'bg-blue-500 text-white'
+                        : dayHasIssue
+                          ? light
+                            ? 'bg-red-100 text-red-800 hover:bg-red-200'
+                            : 'bg-red-500/20 text-red-300 hover:bg-red-500/30'
+                          : hit
+                          ? light
+                            ? 'bg-amber-100 text-amber-800 hover:bg-amber-200'
+                            : 'bg-amber-500/20 text-amber-300 hover:bg-amber-500/30'
+                          : isToday
+                            ? light
+                              ? 'text-blue-600 font-semibold hover:bg-gray-50'
+                              : 'text-blue-400 font-semibold hover:bg-white/[0.04]'
+                            : light
+                              ? 'text-gray-700 hover:bg-gray-50'
+                              : 'text-slate-300 hover:bg-white/[0.04]'
+                    }`}
+                    aria-label={`${day.toUTCString()}${isToday ? ' — today' : ''}${dayLabel}`}
+                    aria-pressed={!!isSelected}
+                  >
+                    {day.getUTCDate()}
+                    {hit && !isSelected && (
+                      <span
+                        className={`absolute bottom-0.5 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full ${
+                          dayHasIssue
+                            ? light ? 'bg-red-500' : 'bg-red-400'
+                            : light ? 'bg-amber-500' : 'bg-amber-400'
+                        }`}
+                        aria-hidden="true"
+                      />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Details panel */}
+          <div className={`border-t ${light ? 'border-gray-100 bg-gray-50/60' : 'border-slate-700/60 bg-black/20'} rounded-b-lg`}>
+            {selectedDay && selectedGroups.length > 0 ? (
+              <div className="max-h-[300px] overflow-y-auto px-3 py-2.5 space-y-3">
+                {selectedGroups.map((g) => (
+                  <MaintenanceDetail
+                    key={g.canonical.arn}
+                    group={g}
+                    light={light}
+                    resolveSpotlight={resolveSpotlight}
+                    setSpotlightNode={setSpotlightNode}
+                    setSpotlightEdge={setSpotlightEdge}
+                  />
+                ))}
+              </div>
+            ) : selectedDay ? (
+              <div className={`px-3 py-3 text-[11px] ${light ? 'text-gray-500' : 'text-slate-500'}`}>
+                No Direct Connect events on {selectedDay.toUTCString().slice(0, 16)} UTC.
+              </div>
+            ) : (
+              <div className={`px-3 py-3 text-[11px] space-y-2 ${light ? 'text-gray-500' : 'text-slate-500'}`}>
+                <div>Select a highlighted date to see details.</div>
+                {/* Two colours now carry meaning, so name them rather than
+                    leaving the user to infer why some days are red. */}
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px]">
+                  <span className="inline-flex items-center gap-1">
+                    <span className={`w-1.5 h-1.5 rounded-full ${light ? 'bg-amber-500' : 'bg-amber-400'}`} aria-hidden="true" />
+                    Planned maintenance
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <span className={`w-1.5 h-1.5 rounded-full ${light ? 'bg-red-500' : 'bg-red-400'}`} aria-hidden="true" />
+                    AWS issue (last {ISSUE_LOOKBACK_DAYS} days)
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Events sharing the same window — identical category, start, end, and affected
+ * resource set. AWS emits multiple PHD reminders for a single maintenance (e.g.
+ * T-14 / T-7 / T-1); we render one card per window and expose every source
+ * notification in a disclosure so the auditor can still trace each original PHD
+ * entry.
+ *
+ * Category is part of the fingerprint: an `issue` and a `scheduledChange` over
+ * the same window on the same resources are genuinely different events, and
+ * merging them would file the outage under whichever card won the sort and
+ * label it with that one's category.
+ */
+type MaintenanceGroup = {
+  canonical: DxMaintenanceEvent;
+  sources: DxMaintenanceEvent[];
+};
+
+function groupEventsByWindow(events: DxMaintenanceEvent[]): MaintenanceGroup[] {
+  const byKey = new Map<string, DxMaintenanceEvent[]>();
+  const ungrouped: DxMaintenanceEvent[] = [];
+
+  for (const e of events) {
+    // Fingerprint requires all three fields — missing any, we treat the event
+    // as its own group so we never silently merge things that may not match.
+    if (!e.startTime || !e.endTime || e.affectedResourceIds.length === 0) {
+      ungrouped.push(e);
+      continue;
+    }
+    const key = `${isIssue(e) ? 'issue' : 'scheduled'}|${e.startTime}|${e.endTime}|${[...e.affectedResourceIds].sort().join(',')}`;
+    const list = byKey.get(key) ?? [];
+    list.push(e);
+    byKey.set(key, list);
+  }
+
+  const groups: MaintenanceGroup[] = [];
+  for (const list of byKey.values()) {
+    const sorted = [...list].sort((a, b) => {
+      const ta = a.lastUpdatedTime ? new Date(a.lastUpdatedTime).getTime() : 0;
+      const tb = b.lastUpdatedTime ? new Date(b.lastUpdatedTime).getTime() : 0;
+      return tb - ta;
+    });
+    groups.push({ canonical: sorted[0], sources: sorted });
+  }
+  for (const e of ungrouped) {
+    groups.push({ canonical: e, sources: [e] });
+  }
+  return groups;
+}
+
+/**
+ * Split a Personal Health Dashboard description into its header and body
+ * using the pattern AWS actually emits:
+ *   "<Title> [AWS Account: <id>]  <body...>"
+ * (note the double-space separator after the closing bracket).
+ *
+ * If the description doesn't match this PHD shape, we return no header and
+ * keep the whole string as body — the UI never invents text that isn't in
+ * the original message.
+ */
+function splitPhdDescription(description: string): { header: string | null; body: string } {
+  const match = description.match(/^([^\n]*?\[AWS Account:[^\]]*\])\s{2,}([\s\S]+)$/);
+  if (match) {
+    return { header: match[1].trim(), body: match[2].trim() };
+  }
+  return { header: null, body: description };
+}
+
+type SpotlightTarget = { kind: 'node' | 'edge'; id: string };
+
+function MaintenanceDetail({
+  group,
+  light,
+  resolveSpotlight,
+  setSpotlightNode,
+  setSpotlightEdge,
+}: {
+  group: MaintenanceGroup;
+  light: boolean;
+  resolveSpotlight: (resourceId: string) => SpotlightTarget | null;
+  setSpotlightNode: (id: string | null) => void;
+  setSpotlightEdge: (id: string | null) => void;
+}) {
+  // Canonical event = the PHD reminder with the newest lastUpdatedTime in the
+  // group. Its description is rendered verbatim; we never synthesize text.
+  const e = group.canonical;
+  const raw = e.description?.trim() ?? '';
+  let header: string | null = null;
+  let body: string;
+
+  if (raw) {
+    const split = splitPhdDescription(raw);
+    header = split.header;
+    body = split.body;
+  } else {
+    // Affected resources get their own chip section below, so we omit them
+    // here to avoid rendering the same IDs twice (once as plain text, once as
+    // interactive chips).
+    body = [
+      `Event type: ${e.eventTypeCode || 'unknown'}`,
+      `Region: ${e.region || 'unknown'}`,
+      e.startTime ? `Start: ${e.startTime}` : null,
+      e.endTime ? `End: ${e.endTime}` : null,
+    ].filter(Boolean).join('\n');
+  }
+
+  // AWS's PHD description text does NOT list the affected dxcon-*/dxvif-* IDs
+  // inline (only the notification email and the console's "Affected resources"
+  // tab do), so scanning the body alone leaves the user unable to tell which
+  // connections/VIFs the maintenance hits. Surface affectedResourceIds — which
+  // we already have from DescribeAffectedEntities — as their own chip section.
+  // Sentinels are filtered at the fetch layer now, but snapshots captured before
+  // that still carry them, so screen here too — the chip is where the damage
+  // showed and this is the last point before it renders.
+  const affectedIds = Array.from(new Set(e.affectedResourceIds ?? [])).filter(
+    (id) => !NON_RESOURCE_ENTITY_VALUES.has(id),
+  );
+
+  // With no IDs left, say why — but only when AWS's scope actually tells us why.
+  // Rendering the sentinel as a chip read as "we failed to identify this" when the
+  // truth is "AWS never scoped it to a resource", and those imply different next
+  // steps for the customer. Where scope is unknown (snapshots predating the field)
+  // we stay silent rather than guess, which is also the pre-existing behaviour for
+  // an event that simply returned no entities.
+  const noResourceReason = affectedIds.length > 0
+    ? null
+    : e.eventScopeCode === 'PUBLIC'
+      ? `AWS reported this as a region-wide event in ${e.region || 'the affected region'} and does not attribute region-wide events to individual resources.`
+      : e.eventScopeCode === 'ACCOUNT_SPECIFIC'
+        ? 'AWS attributed this to the account without naming a connection or virtual interface.'
+        : null;
+
+  const extraCount = group.sources.length - 1;
+
+  // Every card used to look like planned maintenance. A category chip is the one
+  // place the distinction is unambiguous, since AWS's own description text does
+  // not reliably announce which kind of event it is.
+  const issue = isIssue(e);
+  const resolved = issue && !isCurrent(e);
+  const chipLabel = issue
+    ? resolved ? 'AWS issue · resolved' : 'AWS issue · ongoing'
+    : 'Planned maintenance';
+  const chipClass = issue
+    ? resolved
+      ? light ? 'bg-gray-100 border-gray-300 text-gray-600' : 'bg-slate-700/40 border-slate-600/50 text-slate-300'
+      : light ? 'bg-red-50 border-red-200 text-red-700' : 'bg-red-500/10 border-red-500/30 text-red-300'
+    : light ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-amber-500/10 border-amber-500/30 text-amber-300';
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-1.5">
+        <span className={`inline-block px-1.5 py-[1px] rounded border text-[9px] font-semibold uppercase tracking-wide ${chipClass}`}>
+          {chipLabel}
+        </span>
+        {issue && (
+          <span className={`text-[10px] ${light ? 'text-gray-500' : 'text-slate-500'}`}>
+            {resolved ? 'AWS reports this as closed' : 'reported by AWS as still open'}
+          </span>
+        )}
+      </div>
+      {header && (
+        <div className={`text-[12px] font-semibold leading-snug ${light ? 'text-gray-800' : 'text-slate-100'}`}>
+          {header}
+        </div>
+      )}
+      <div
+        className={`text-[11px] leading-relaxed whitespace-pre-wrap break-words font-sans m-0 ${
+          light ? 'text-gray-700' : 'text-slate-300'
+        }`}
+      >
+        {renderBodyWithResourceChips(body, resolveSpotlight, setSpotlightNode, setSpotlightEdge, light)}
+      </div>
+      {(affectedIds.length > 0 || noResourceReason) && (
+        <div className="space-y-1 pt-2">
+          <div className={`text-[11px] font-semibold ${light ? 'text-gray-800' : 'text-slate-100'}`}>
+            Affected resources
+          </div>
+          {affectedIds.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {affectedIds.map((id) => (
+                <ResourceChip
+                  key={id}
+                  resourceId={id}
+                  target={resolveSpotlight(id)}
+                  light={light}
+                  setSpotlightNode={setSpotlightNode}
+                  setSpotlightEdge={setSpotlightEdge}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className={`text-[10.5px] leading-relaxed ${light ? 'text-gray-600' : 'text-slate-400'}`}>
+              {noResourceReason}
+            </div>
+          )}
+        </div>
+      )}
+      {extraCount > 0 && (
+        <details className="group">
+          <summary
+            className={`cursor-pointer list-none text-[10px] font-medium tracking-wide uppercase select-none ${
+              light ? 'text-gray-500 hover:text-gray-700' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <span className="inline-flex items-center gap-1">
+              <svg
+                className="w-3 h-3 transition-transform group-open:rotate-90"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+              {group.sources.length} PHD notifications for this window
+            </span>
+          </summary>
+          <ul className={`mt-1.5 space-y-1 text-[10px] font-mono ${light ? 'text-gray-500' : 'text-slate-500'}`}>
+            {group.sources.map((s) => (
+              <li key={s.arn} className="break-all">
+                <span className={light ? 'text-gray-700' : 'text-slate-300'}>{s.arn}</span>
+                {s.lastUpdatedTime && (
+                  <span className="ml-1">· updated {s.lastUpdatedTime}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
+// AWS DX resource IDs embedded in PHD descriptions. Matches: dxcon-*, dxvif-*,
+// dxgw-* on word boundaries so surrounding punctuation doesn't get absorbed.
+const DX_RESOURCE_ID_RE = /\b(dx(?:con|vif|gw)-[A-Za-z0-9]+)\b/g;
+
+/** Tokenize body text, wrapping DX resource IDs in hoverable chips that
+ *  spotlight the matching node or edge. Unmatched runs render as plain text
+ *  so the original PHD wording is preserved verbatim. */
+function renderBodyWithResourceChips(
+  body: string,
+  resolveSpotlight: (resourceId: string) => SpotlightTarget | null,
+  setSpotlightNode: (id: string | null) => void,
+  setSpotlightEdge: (id: string | null) => void,
+  light: boolean,
+): ReactNode[] {
+  const parts: ReactNode[] = [];
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let i = 0;
+  DX_RESOURCE_ID_RE.lastIndex = 0;
+  while ((match = DX_RESOURCE_ID_RE.exec(body)) !== null) {
+    if (match.index > last) parts.push(body.slice(last, match.index));
+    const resourceId = match[1];
+    const target = resolveSpotlight(resourceId);
+    parts.push(
+      <ResourceChip
+        key={`chip-${i++}-${match.index}`}
+        resourceId={resourceId}
+        target={target}
+        light={light}
+        setSpotlightNode={setSpotlightNode}
+        setSpotlightEdge={setSpotlightEdge}
+      />,
+    );
+    last = match.index + resourceId.length;
+  }
+  if (last < body.length) parts.push(body.slice(last));
+  return parts;
+}
+
+function ResourceChip({
+  resourceId,
+  target,
+  light,
+  setSpotlightNode,
+  setSpotlightEdge,
+}: {
+  resourceId: string;
+  target: SpotlightTarget | null;
+  light: boolean;
+  setSpotlightNode: (id: string | null) => void;
+  setSpotlightEdge: (id: string | null) => void;
+}) {
+  const resolvable = target != null;
+  const enter = () => {
+    if (!target) return;
+    if (target.kind === 'edge') setSpotlightEdge(target.id);
+    else setSpotlightNode(target.id);
+  };
+  const leave = () => {
+    setSpotlightNode(null);
+    setSpotlightEdge(null);
+  };
+  return (
+    <button
+      type="button"
+      onMouseEnter={enter}
+      onMouseLeave={leave}
+      onFocus={enter}
+      onBlur={leave}
+      disabled={!resolvable}
+      title={resolvable ? `Highlight ${resourceId} on canvas` : `${resourceId} (not in current topology)`}
+      className={`inline font-mono text-[10.5px] px-1 py-[1px] rounded border align-baseline transition-colors ${
+        resolvable
+          ? light
+            ? 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100 hover:border-amber-300 cursor-pointer'
+            : 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20 hover:border-amber-500/50 cursor-pointer'
+          : light
+            ? 'bg-gray-100 border-gray-200 text-gray-500 cursor-default'
+            : 'bg-slate-700/40 border-slate-600/40 text-slate-400 cursor-default'
+      }`}
+    >
+      {resourceId}
+    </button>
+  );
+}

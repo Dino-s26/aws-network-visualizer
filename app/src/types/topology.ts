@@ -1,0 +1,377 @@
+import type { Node, Edge } from '@xyflow/react';
+import type {
+  DxConnection,
+  DxVirtualInterface,
+  DxGateway,
+  DxGatewayAssociation,
+  DxLocation,
+  DxLag,
+  Vpc,
+  VpnGateway,
+  VpnConnection,
+  VpnTunnel,
+  TransitGateway,
+  TransitGatewayAttachment,
+  TransitGatewayPeeringAttachment,
+  VpcPeeringConnection,
+  CustomerGateway,
+  CloudWanCoreNetwork,
+  CloudWanAttachment,
+  CloudWanPeering,
+  TgwRouteTableWithRoutes,
+  VpcRouteTable,
+  CloudWanSegmentRoutes,
+  DxMaintenanceEvent,
+  VifRoutes,
+  BgpPrefixMetrics,
+  BgpSessionStability,
+  VifFailoverTest,
+} from './aws-resources';
+
+export interface TopologyData {
+  connections: DxConnection[];
+  virtualInterfaces: DxVirtualInterface[];
+  dxGateways: DxGateway[];
+  dxGatewayAssociations: DxGatewayAssociation[];
+  locations: DxLocation[];
+  lags: DxLag[];
+  vpcs: Vpc[];
+  vpnGateways: VpnGateway[];
+  vpnConnections: VpnConnection[];
+  transitGateways: TransitGateway[];
+  transitGatewayAttachments: TransitGatewayAttachment[];
+  transitGatewayPeeringAttachments: TransitGatewayPeeringAttachment[];
+  vpcPeerings: VpcPeeringConnection[];
+  customerGateways: CustomerGateway[];
+  cloudWanCoreNetworks: CloudWanCoreNetwork[];
+  cloudWanAttachments: CloudWanAttachment[];
+  cloudWanPeerings: CloudWanPeering[];
+  tgwRouteTables: Map<string, TgwRouteTableWithRoutes[]>;
+  /** VPC route tables keyed by vpcId. Each entry includes routes + subnet associations. */
+  vpcRouteTables: Map<string, VpcRouteTable[]>;
+  cloudWanRoutes: Map<string, CloudWanSegmentRoutes[]>;
+  // `accepted`/`advertised` are IPv4+IPv6 pooled (display); `byFamily` carries
+  // the per-address-family split, which is what the 100-prefix quota check must
+  // read — the limit is 100 *each* for IPv4 and IPv6.
+  bgpPrefixMetrics?: Map<string, BgpPrefixMetrics>;
+  // BGP flap history per VIF, keyed by virtualInterfaceId. Populated on demand
+  // (billed per metric retrieved) — see loadBgpStability() in the store.
+  bgpStability?: Map<string, BgpSessionStability>;
+  // Recorded BGP failover tests per VIF, keyed by virtualInterfaceId, from
+  // ListVirtualInterfaceTestHistory. Populated on demand. An entry with an empty
+  // array means "queried, none on record"; a MISSING entry means "not queried" —
+  // ruleDxFailoverTesting depends on that distinction.
+  vifFailoverTests?: Map<string, VifFailoverTest[]>;
+  // Actual BGP prefixes exchanged per VIF, keyed by virtualInterfaceId, from
+  // ListVirtualInterfaceRoutes. Populated only when the user enables the
+  // "BGP Routes" overlay — see loadVifRoutes() in the store.
+  vifRoutes?: Map<string, VifRoutes>;
+  /**
+   * Peak throughput per VIF. `*BpsPeak` comes from `VirtualInterfaceBps*`, which is
+   * what the app fetches. `*UtilPctPeak` is AWS's own `VirtualInterfaceUtilization*`
+   * percentage and is populated only by producers that ask for it (the
+   * nwra-skill's CLI sweep): a partner-hosted VIF can publish the
+   * percentage while `Bps*` returns nothing at all, so without these fields such an
+   * account reads as entirely unmeasured. The percentage's denominator is AWS's, not
+   * ours, and the metric is undocumented — so it is reported, never graded.
+   */
+  vifUtilization?: Map<string, {
+    ingressBpsPeak?: number;
+    egressBpsPeak?: number;
+    ingressUtilPctPeak?: number;
+    egressUtilPctPeak?: number;
+  }>;
+  connectionUtilization?: Map<string, { ingressBpsPeak?: number; egressBpsPeak?: number }>;
+  utilizationWindowDays?: 30 | 60 | 90;
+  maintenanceEvents?: DxMaintenanceEvent[];
+  homeAccountId?: string;
+  regionNames?: Map<string, string>;
+  publicVifResources?: PublicVifResource[];
+  /**
+   * Resources that failed to load, or loaded incompletely.
+   *
+   * This exists because a failed fetch used to be indistinguishable from an
+   * empty account. `logged()` in fetch-topology.ts catches, records, and
+   * returns `[]`, so an AccessDenied, a throttle, a network blip or a
+   * pagination cap all produced a topology that looked complete and correct.
+   *
+   * That is not merely "some data is missing". Several rules read absence as a
+   * pass: an empty `vpcRouteTables` means `ruleBlackholeRoutes` finds no
+   * blackholes and `ruleVpcNoHybridRoute` finds nothing missing, so a failed
+   * fetch could RAISE the resiliency score and hand back a green report on an
+   * estate with a real fault.
+   *
+   * Absent or empty means "nothing known to have failed". It is optional so
+   * snapshots taken before this existed still load.
+   */
+  fetchIssues?: FetchIssue[];
+  /**
+   * When VIF routes and this account's TGW route tables were last read TOGETHER
+   * (ISO). Set by the live route fetch; the report prints it so a reader knows the
+   * grades and the Active via column describe the same moment.
+   */
+  routesReadAt?: string;
+}
+
+/** Severity of a partial-data problem, which decides how the banner reads. */
+export type FetchIssueKind =
+  /** The resource is missing entirely — the caller received `[]`. */
+  | 'failed'
+  /** Some data arrived, but a cap or limit stopped the rest. */
+  | 'truncated';
+
+export interface FetchIssue {
+  /**
+   * The `logged()` label, e.g. `ap-southeast-1/VpcRouteTables`. Kept verbatim
+   * rather than parsed into region + resource: the labels are not uniformly
+   * shaped (some carry an account id or a gateway suffix), and a half-working
+   * parser would drop the detail that makes the message actionable.
+   */
+  label: string;
+  kind: FetchIssueKind;
+  /** The underlying error text, already trimmed of stack. */
+  message: string;
+}
+
+export interface PublicVifResource {
+  virtualInterfaceId: string;
+  service: 'S3' | 'CloudFront' | 'EC2' | 'DynamoDB' | 'API Gateway' | 'Route 53' | 'Elastic IP';
+  resourceId: string;
+  resourceName?: string;
+}
+
+export type ViewMode = 'current' | 'recommended';
+
+/** All keys must match on one resource; null matches any value, including empty. */
+export interface TopologyTagFilter {
+  key: string;
+  value: string | null;
+}
+
+export interface GraphData {
+  nodes: Node[];
+  edges: Edge[];
+}
+
+export type NodeCategory =
+  | 'customerSite'
+  | 'onPremise'
+  | 'cgw'
+  | 'dxLocation'
+  | 'dxPartnerDevice'
+  | 'dxPartnerDeviceGroup'
+  | 'lag'
+  | 'awsDevice'
+  | 'dxGateway'
+  | 'tgw'
+  | 'tgwConnect'
+  | 'tgwFirewall'
+  | 'vgw'
+  | 'vpc'
+  | 'vpcGroup'
+  | 'tgwGroup'
+  | 'isolatedTgwGroup'
+  | 'region'
+  | 'unattachedZone'
+  | 'hiddenAssocZone'
+  | 'awsCloud'
+  | 'coreNetwork'
+  | 'publicResources';
+
+export interface VpcChildInfo {
+  vpcId: string;
+  name: string;
+  cidr: string;
+  state: string;
+  region?: string;
+  crossAccount?: boolean;
+  ownerAccount?: string;
+}
+
+// One VPC-peering relationship as seen from a specific VPC node's perspective.
+// Precomputed at build time (where peer names/regions resolve) and stamped onto
+// the local VPC's node data so the node can list "who am I peered with" without
+// forcing the user to trace bundled peering edges on the canvas.
+export interface VpcPeerInfo {
+  // The React Flow edge id of the peering edge, so hovering a row can spotlight
+  // exactly that edge on the canvas.
+  edgeId: string;
+  pcxId: string;
+  state?: string;
+  // The *other* VPC in the relationship.
+  peerVpcId: string;
+  peerName: string;
+  peerRegion: string;
+  peerCidr?: string;
+  // 'out' when this VPC is the peering requester, 'in' when it is the accepter.
+  direction: 'in' | 'out';
+  crossAccount?: boolean;
+  peerOwnerAccount?: string;
+}
+
+export interface TgwChildInfo {
+  tgwId: string;
+  name: string;
+  state: string;
+  asn?: string;
+  region?: string;
+  crossAccount?: boolean;
+  ownerAccount?: string;
+}
+
+export interface VgwChildInfo {
+  vgwId: string;
+  name: string;
+  state: string;
+  asn?: string;
+  region?: string;
+  attachmentState?: string;
+}
+
+export interface DxgwChildInfo {
+  dxgwId: string;
+  name: string;
+  state: string;
+  asn?: string;
+}
+
+export interface HiddenAssocChildInfo {
+  dxGatewayId: string;
+  dxGatewayName: string;
+  state: string;
+  reason: 'prefixPool';
+}
+
+export interface DxNodeData extends Record<string, unknown> {
+  label: string;
+  category: NodeCategory;
+  isRecommended?: boolean;
+  isInferred?: boolean;
+  isOrphan?: boolean;
+  // Orphan VPCs (no TGW/VGW/Cloud WAN attachment) and isolated TGWs
+  // (no attachments of any kind) — marked so the "Show unattached" toolbar
+  // toggle can hide them en masse without touching the rest of the graph.
+  isUnattached?: boolean;
+  resourceId?: string;
+  details?: Record<string, string>;
+  badges?: NodeBadge[];
+  childCount?: number;
+  // Resource ids folded into a collapsed group card that carries no per-child
+  // rows (e.g. `tgwGroup`), so the card can say how many match a tag filter.
+  memberResourceIds?: string[];
+  isExpanded?: boolean;
+  targetHandleIds?: string[];
+  hasTopHandle?: boolean;
+  // TGWs involved in a TGW↔TGW or Cloud WAN↔TGW peering need named left
+  // handles for the peering edges to anchor to. Flagged per-node so the
+  // handles only render when an edge actually references them — otherwise
+  // ReactFlow picks the left source handle ahead of the default Right
+  // source handle for unqualified edges (e.g. TGW→VPC).
+  hasPeeringHandle?: boolean;
+  // VPC-peering relationships for this VPC, precomputed so the node can render a
+  // "Peers ▾" list — the readable alternative to tracing many bundled peering
+  // edges that all leave the same handle.
+  vpcPeers?: VpcPeerInfo[];
+  vpcChildren?: VpcChildInfo[];
+  // vpcGroup only: VPCs left out of `vpcChildren` because they are already drawn
+  // as their own card (behind a VGW), with this group's TGW edged to that card.
+  separateVpcCount?: number;
+  tgwChildren?: TgwChildInfo[];
+  vgwChildren?: VgwChildInfo[];
+  dxgwChildren?: DxgwChildInfo[];
+  hiddenAssocChildren?: HiddenAssocChildInfo[];
+  // Total VPCs reachable only via non-DX TGWs/VGWs — drives the Region header
+  // "Show/Hide non-DX" toggle label. Whether they're currently hidden is
+  // derived from `showNonDxVpcs.has(regionCode)` in the store.
+  nonDxVpcCount?: number;
+}
+
+export interface NodeBadge {
+  type: 'warning' | 'info' | 'error';
+  label: string;
+  description: string;
+}
+
+export type DxNode = Node<DxNodeData>;
+export type DxEdge = Edge & {
+  data?: {
+    isRecommended?: boolean;
+    isInferred?: boolean;
+    vifType?: 'private' | 'transit' | 'public';
+    vlan?: number;
+    label?: string;
+    connectionId?: string;
+    connectionState?: string;
+    tunnels?: VpnTunnel[];
+    vifState?: string;
+    bgpStatus?: string;
+    vifId?: string;
+    // DescribeVirtualInterfaces.virtualInterfaceName — the customer's own name
+    // for the VIF, which is how they refer to it in a ticket or a console
+    // search. Optional because AWS returns it empty for unnamed VIFs; the label
+    // then falls back to the ID alone rather than printing a blank line.
+    vifName?: string;
+    prefixesAccepted?: number;
+    prefixesAdvertised?: number;
+    // True when ListVirtualInterfaceRoutes returned routes for this VIF, so the
+    // edge label can offer a "Routes" affordance. The routes themselves live in
+    // TopologyData.vifRoutes and are read by VifRoutePanel — only the flag
+    // travels on the edge, to keep edge data cheap to diff.
+    hasRouteData?: boolean;
+    // Peak hourly bitrate over the user-selected window (30/60/90 days) from
+    // CloudWatch (AWS/DX namespace). Populated only when the user enables
+    // "Show utilization" in live mode.
+    utilizationIngressBps?: number;
+    utilizationEgressBps?: number;
+    // Underlying connection bandwidth string (e.g. "1Gbps") — used to format
+    // utilization as a percentage of capacity on VIF edges.
+    connectionBandwidth?: string;
+    // Per-VIF bandwidth cap from DescribeVirtualInterfaces.rateLimit. When
+    // present this, not connectionBandwidth, is the utilization denominator.
+    vifRateLimit?: string;
+    labelPosition?: number;
+    sourceHandle?: string;
+    targetHandle?: string;
+    edgeStyle?: 'smoothstep';
+    // Lateral peering edges (VPC↔VPC, TGW↔TGW, Cloud WAN↔TGW). Hovering these
+    // highlights only the single edge + its two endpoints, not a full E2E BFS
+    // path — a peering is a point-to-point relationship, not an upstream path.
+    isPeering?: boolean;
+    // Excludes the edge from the directed path graph: it is a cable between two
+    // devices that back each other up, not a step along anyone's path. The
+    // end-to-end traversal attaches it (and the device at the far end) to a path
+    // it touches, then stops, so the highlight cannot depend on which end the
+    // edge happens to be drawn from. Set on user-drawn Customer Links, whose
+    // direction is a purely cosmetic routing choice.
+    isLateral?: boolean;
+    // For VPC↔VPC peering edges: whether both endpoints sit in the SAME region
+    // ('intra') or different regions ('cross'). Drives lane routing — intra
+    // peerings stay inside their region box with a fixed lane offset; cross
+    // peerings route outside the region (but inside AWS) via the existing scan.
+    peeringScope?: 'intra' | 'cross';
+    aggregatedVifs?: AggregatedVifInfo[];
+    // Parallel-edge bowing: when several edges connect the SAME two nodes (e.g.
+    // the customer-gateway → LAG member links), each shares one source/target
+    // dot. CustomEdge bows edge `parallelIndex` of `parallelCount` off the
+    // straight chord by a per-index offset so they read as distinct lines with
+    // vertically-separated labels.
+    parallelIndex?: number;
+    parallelCount?: number;
+  };
+};
+
+export interface AggregatedVifInfo {
+  vifId: string;
+  vifName?: string;
+  vifType: 'private' | 'transit' | 'public';
+  vlan: number;
+  vifState: string;
+  bgpStatus?: string;
+  prefixesAccepted?: number;
+  prefixesAdvertised?: number;
+  hasRouteData?: boolean;
+  vifRateLimit?: string;
+  utilizationIngressBps?: number;
+  utilizationEgressBps?: number;
+  connectionBandwidth?: string;
+}
