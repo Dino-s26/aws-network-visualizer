@@ -154,7 +154,7 @@ BEDROCK_ENABLED, BEDROCK_MODEL_ID, BEDROCK_GUARDRAIL_ID, BEDROCK_GUARDRAIL_VERSI
 - 27 files would be in the push (12 tracked changes incl. staged deletion of references/ gitlink, 16 untracked + docs). references/ is ignored (local only).
 
 ## Hygiene results: ALL CLEAR
-- No files > 1 MB. No AWS key / private key / token patterns. No credential-like assignments. No local path or hostname leaks (/Users/dino, N1-DINO). Only env file in the set is app/.env.example (intended). LICENSE, NOTICE, README.md, .gitignore, docker-compose.yml, .dockerignore present.
+- No files > 1 MB. No AWS key / private key / token patterns. No credential-like assignments. No local path or hostname leaks (<local-user-path>, <local-folder>). Only env file in the set is app/.env.example (intended). LICENSE, NOTICE, README.md, .gitignore, docker-compose.yml, .dockerignore present.
 
 ## Verification status: NOT YET DONE (blocks merge, not a WIP branch push)
 - Never run: unit tests (upstream + ours), tsc -b, docker build, container smoke test (/healthz, /config.js, headers, CSP), image size.
@@ -203,3 +203,93 @@ PASS / FAIL / INCONCLUSIVE (with reason). A static trace cannot prove everything
 - 2c engine extensions (IGW/NAT, VPC endpoints, Network Firewall stateless + simple 5-tuple stateful, else INCONCLUSIVE) + tests
 - 2d UI panel (source/destination/protocol/port picker, hop list, highlight first failing hop on canvas)
 Sequencing: finish Phase 1 verification (docker test build, image build/smoke test) before starting 2a.
+
+---
+# Checkpoint 11 (2026-11-14) - Phase 1 unit tests verified
+
+## Result: docker build -f docker/Dockerfile --target test .  =>  92/92 test files, 1367/1367 tests PASS (node:22-alpine)
+- First run: 1366/1367. Single failure was a bug in OUR test helper (runtime-config.test.mjs): directive regex captured the closing `" always` for the last CSP directive (frame-ancestors). Fixed regex to `([^;"]*)`. Script itself was correct.
+- All ~1,300 upstream tests still pass with our config.ts / App.tsx / TopBar.tsx / sso-api.ts changes.
+- 40-runtime-config.sh verified under alpine busybox sh (tr, sed -E, grep -E behave as expected); injection tests pass.
+
+## Not yet verified
+- Production image build (npm run build incl. tsc -b + vite build, fontsource file names, strip-CSP step).
+- Container smoke test: starts non-root, /tmp/nwv generated, include /tmp/nwv/csp.conf ok, GET /healthz, /config.js, headers + CSP present on /, /assets/*, /config.js; works with --read-only + tmpfs /tmp.
+- Image size (estimate 50-60 MB on disk).
+- Browser check: fonts load from 'self', no CSP violations in console, demo data loads, chat hidden when BEDROCK_ENABLED unset and shown when true.
+
+## Next (needs approval: builds image, starts a container on localhost:8080)
+1. docker build -f docker/Dockerfile -t aws-network-visualizer:dev .
+2. docker run --rm --read-only --tmpfs /tmp -p 8080:8080 aws-network-visualizer:dev (via compose or direct), curl checks, docker images size, then stop container.
+
+---
+# Checkpoint 12 (2026-11-14) - Phase 1 production image built and smoke-tested
+
+## Build: docker build -f docker/Dockerfile -t aws-network-visualizer:dev .  => OK on first try
+- tsc -b + vite build pass. Fontsource names correct (latin 400/500/600/700 + mono 400, woff2 + woff both bundled). ChatPanel is a separate lazy chunk (283 kB, 83 kB gz) -> chat + Bedrock SDK only load when enabled. Main bundle 1.62 MB (434 kB gz) - upstream size, candidate for code-splitting later.
+- Image size: 62.2 MB on disk (estimate was 50-60 MB). Base nginx-unprivileged:stable-alpine is nginx 1.30.6 on Alpine 3.x; app static files add roughly 3 MB.
+
+## Smoke test: docker run --read-only --tmpfs /tmp --cap-drop ALL --no-new-privileges -p 127.0.0.1:8080:8080  => ALL PASS
+- Runs as uid 101 (nginx), non-root. Health status: healthy. /healthz 200. SPA fallback 200.
+- Headers on /: nosniff, X-Frame-Options DENY, Referrer-Policy no-referrer, Permissions-Policy, COOP/CORP same-origin, CSP (script-src 'self', connect-src 'self' https://*.amazonaws.com, font-src 'self' data:, frame-ancestors none), Cache-Control no-cache. Server version hidden.
+- /config.js: served from /tmp/nwv, no-store, bedrockEnabled false. Assets: immutable, 1-year cache, CSP + nosniff present (location header re-includes work).
+- Served index.html: CSP meta removed (0), /config.js script tag present (1).
+
+## Known / accepted
+- style-src keeps 'unsafe-inline' (React Flow/inline styles). No HSTS in nginx by design (terminate TLS upstream).
+- woff duplicates (~91 kB) ship next to woff2; optional trim.
+- docker-compose.yml not yet exercised (same settings as the manual run).
+- Browser-level checks still open: fonts actually render from 'self', no CSP violations in console, demo data loads, chat button hidden with BEDROCK_ENABLED unset, shown when true.
+- Container nwv-smoke left RUNNING on 127.0.0.1:8080 for the browser check. Stop with: docker rm -f nwv-smoke
+
+## Next options
+1. Browser check (user, or Claude in Chrome), then stop container.
+2. Update README Quick start with the real command and measured size.
+3. Commit/push branch feat/phase1-docker-runtime-config (hygiene scan was clean; re-scan new/changed files first).
+4. Test docker compose up. 5. Start Phase 2a (reachability data layer).
+
+---
+# Checkpoint 13 (2026-11-14) - Phase 1 browser check done by user
+
+- User opened http://127.0.0.1:8080 in a browser: demo data loaded (UI renders from the container). Claude in Chrome extension was not connected, so console/CSP-violation and chat-button checks were not independently confirmed by Claude; user reported only that demo data loaded.
+- Asset-side checks (curl) all passed: 0 Google Font refs, 5 woff2 files 200 font/woff2, local @font-face for both families, lazy ChatPanel chunk served.
+- Phase 1 status: image builds (62.2 MB), tests 1367/1367 pass, container runs non-root/read-only/healthy, headers + CSP verified, UI loads. Remaining Phase 1 polish: README quick start with real command/size, docker compose up test, GHCR CI, commit/push branch.
+- Container nwv-smoke may still be running on 127.0.0.1:8080 (stop: docker rm -f nwv-smoke).
+
+---
+# Checkpoint 14 (2026-11-14) - change inventory (read-only scan; NO commit made, nothing staged)
+
+## Repo history as found (user did git work outside this chat)
+- Remote origin/main == local main == current branch feat/phase-1-dockerize == 5dfe0ce.
+- Commits on main: 2888d36 Init -> 2df6275 PR #4 "Feat: Revamp aws-sample/sample-network-resilience-agent" (our Phase 1 work, 15 files incl. docker/*, tests, LICENSE, NOTICE, .gitignore, .dockerignore, compose) -> Dependabot PRs #1 happy-dom 20.10.1 -> 21.0.4, #2 vite 8.0.16 -> 8.3.8, #3 vitest/@vitest/mocker -> vitest ^4.1.12.
+- Other branches: feat/revamp-original-aws-repo (remote, source of PR #4). Current branch has no upstream yet.
+- No .github/ tracked: no CI, no tracked dependabot config.
+
+## Uncommitted working-tree changes (tracked files only; no untracked files)
+- README.md: rewritten (+40 -17): tested docker build/run quick start, 62 MB size, env var table, Bedrock off by default, roadmap w/ reachability scope, layout note on git-ignored references/.
+- app/tests/docker/runtime-config.test.mjs: regex fix `([^;]*)` -> `([^;"]*)` (+1 -1).
+- docs/checkpoint.md: +52 lines (checkpoints 9-13 and this one).
+- Ignored/local only: references/ (upstream clone).
+- docker/40-runtime-config.sh mode is 755 (executable bit OK).
+
+## Findings / risks
+1. COMMITTED test is the buggy version: main still has the `[^;]*` regex, so `npm test` has 1 failing test on main until the fix above is committed.
+2. Dependabot bumps (vite minor, happy-dom MAJOR 20 -> 21, vitest) were merged AFTER our verified run (1367/1367 on old versions). Tests and production build must be re-run on the bumped lockfile.
+3. Privacy nit: committed docs/checkpoint.md (line 157, Checkpoint 8) contains the user's local username and local folder name as literal strings (quoted from a leak-scan pattern). It is on the remote now. Fix going forward by rewording the line; removing it from history is optional and probably not worth a rewrite.
+4. Secret scan of changed files AND of the committed tree: clean (no AWS keys, private keys, tokens, credential-like assignments). No files > 1 MB. No .env files besides app/.env.example.
+5. docs/CLAUDE.md "Phases and status" is stale (still says Phase 1 NEXT / first reads pending).
+
+## Pending decisions
+- Re-run docker build --target test and the production build on the bumped dependencies (needs approval).
+- Reword checkpoint line 157 (working tree only).
+- User commits: README + test fix + docs on a branch; open PR. Add CI (GitHub Actions: test stage, image build, GHCR publish) later.
+- Refresh CLAUDE.md status lines.
+
+---
+# Checkpoint 15 (2026-11-14) - bumped deps verified, local-name literals reworded (no commit made)
+
+- Test stage on the Dependabot-bumped lockfile (vite ^8.3.8, vitest ^4.1.12, happy-dom ^21.0.4): 92/92 files, 1367/1367 tests PASS (in alpine). The happy-dom major bump caused no failures.
+- Production build on bumped deps: OK. Image still 62.2 MB. Chunk hashes changed (ChatPanel chunk 283 kB, main 1.62 MB); no bundling regressions seen. Container not started this round (no smoke test on the new build).
+- docs/checkpoint.md: replaced 2 literal occurrences of the user's local username path and local folder name with placeholders (working tree only). The old text still exists in committed history/main until the reworded file is committed.
+- Uncommitted set (user to commit): README.md, app/tests/docker/runtime-config.test.mjs (regex fix: main currently has 1 failing test), docs/checkpoint.md.
+- Still open: refresh stale status lines in docs/CLAUDE.md; CI (GitHub Actions); docker compose up test; optional container smoke test on the bumped build; Phase 2a.

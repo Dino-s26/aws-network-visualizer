@@ -2,20 +2,37 @@
 
 Interactive AWS network topology viewer: discover your Direct Connect, Transit Gateway and VPC layout, see resilience gaps, and (planned) trace whether traffic can flow from A to B.
 
-> **Status: early work in progress.** Forked from [aws-samples/sample-network-resilience-agent](https://github.com/aws-samples/sample-network-resilience-agent). The Docker image and reachability features below are planned, not released yet.
+> **Status: early work in progress.** Forked from [aws-samples/sample-network-resilience-agent](https://github.com/aws-samples/sample-network-resilience-agent). The Docker image works today. Reachability tracing is planned, not released yet.
 
-## Goals
-- **Minimal setup:** one `docker run`, no npm, no required config.
-- **Small image:** static files served by nginx, nothing else.
-- **Optional AI:** Amazon Bedrock chat is off unless you configure it.
-- **Flow checks (planned):** static reachability across VPCs, subnets, route tables, NACLs, security groups and Transit Gateways.
-- **Simple UX:** low friction, customizable, minimal animation.
+## Quick start (Docker)
+```
+docker build -f docker/Dockerfile -t aws-network-visualizer .
+docker run --rm -p 127.0.0.1:8080:8080 aws-network-visualizer
+```
+Open http://localhost:8080 and choose **Use demo data** or **Connect AWS**. The image is about 62 MB, runs as a non-root user, and needs no configuration.
 
-## Quick start (planned)
+Hardened run (read-only filesystem, no extra privileges):
 ```
-docker run --rm -p 8080:8080 <image>
+docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
+  --security-opt no-new-privileges:true -p 127.0.0.1:8080:8080 aws-network-visualizer
 ```
-Then open http://localhost:8080 and choose **Use demo data** or **Connect AWS**.
+
+## Configuration (all optional, set with `-e NAME=value`)
+| Variable | Default | Purpose |
+|---|---|---|
+| `BEDROCK_ENABLED` | `false` | Show the Amazon Bedrock chat assistant (exact value `true`) |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-opus-5` | Bedrock model for chat |
+| `BEDROCK_GUARDRAIL_ID`, `BEDROCK_GUARDRAIL_VERSION` | empty, `DRAFT` | Bedrock Guardrail (recommended when chat is on) |
+| `DEFAULT_REGION` | `us-east-1` | Region used for demo mode and as fallback |
+| `DEFAULT_SCENARIO` | `noResiliency` | Demo scenario: `noResiliency`, `devTest`, `high`, `maximum`, `crossAccount` |
+| `APP_TITLE` | `Network Resilience Agent` | Title in the top bar |
+| `SSO_BACKEND_URL` | empty | Optional SSO backend (see `app/docs/SETUP.md`) |
+| `MAX_TOOL_ROUNDS` | `5` | Max chat tool-use rounds per turn |
+| `CSP_CONNECT_EXTRA` | empty | Extra allowed origins for browser requests, space separated |
+
+Values are checked and restricted to safe characters when the container starts. The SSO backend origin is added to the Content-Security-Policy automatically.
+
+**Bedrock chat is off by default.** Turning it on needs Bedrock model access in your AWS account. Use a Bedrock Guardrail for anything beyond local testing.
 
 ## Run from source
 Requires Node.js 22 or newer. From `app/`:
@@ -25,24 +42,30 @@ npm run dev       # dev server on :5173 with demo data
 npm run build     # static bundle in dist/
 npm test          # unit tests
 ```
+To run the full test suite inside a container instead (no local install):
+```
+docker build -f docker/Dockerfile --target test .
+```
 
 ## Security model
 - The app is a static page. AWS API calls are made from your browser using credentials you enter.
 - Credentials are not stored. Use short-lived credentials (SSO or temporary keys) and a read-only IAM role.
+- The container serves strict security headers, including a Content-Security-Policy. Add HSTS at your TLS terminator.
 - Do not share exported topology snapshots without using the sanitized export.
 
 ## Roadmap
-1. Docker image, runtime configuration, nginx security headers, optional Bedrock
-2. Static VPC reachability trace (A to B) with a TTL cache for AWS calls
+1. Docker image, runtime configuration, nginx security headers, optional Bedrock (done)
+2. Static reachability trace (A to B): route tables, security groups, NACLs, Transit Gateway, peering, VPN, Direct Connect, internet and NAT gateways, VPC endpoints and Network Firewall. Anything that cannot be evaluated statically is reported as inconclusive, not guessed.
 3. UI/UX settings, reduced motion, optional local cache and restore-last-view
-4. Optional: scan history, VPC Flow Logs analysis, Network Firewall support
+4. Optional: scan history, VPC Flow Logs analysis
 
 ## Project layout
 ```
-app/          web application (React, TypeScript, Vite)
-docker/       Dockerfile and nginx configuration
-docs/         checkpoint and project notes
-references/   pristine upstream copy, read-only
+app/                web application (React, TypeScript, Vite)
+docker/             Dockerfile, nginx config, runtime config script
+docker-compose.yml  compose equivalent of the run command
+docs/               checkpoint and project notes
+references/         optional, git-ignored: clone upstream here to compare
 ```
 
 ## Credits
