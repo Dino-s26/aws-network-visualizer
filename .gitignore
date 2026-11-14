@@ -1,0 +1,51 @@
+# === Guard-rail: never commit secrets or real network data ===
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.ovpn
+.aws/
+**/credentials
+**/.npmrc
+*.tfstate
+*.tfstate.*
+
+# Topology exports contain real account IDs, IPs, CIDRs, ASNs
+snapshots/
+exports/
+*.snapshot.json
+*-snapshot*.json
+*resilience-report*.html
+*.pcap
+*.pcapng
+
+# Upstream reference clone (pristine, local only; re-create with git clone)
+references/
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+*.tsbuildinfo
+lambda.zip
+*.log
+npm-debug.log*
+
+# Docker local overrides
+docker/.env
+docker-compose.override.yml
+
+# OS and editor
+.DS_Store
+.localized
+.idea/
+.vscode/
+*.swp

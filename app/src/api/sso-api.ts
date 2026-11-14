@@ -1,3 +1,5 @@
+import { config } from '../utils/config';
+
 // Reject anything that isn't HTTPS, except http://localhost / 127.0.0.1 for dev.
 // Prevents an attacker who can write localStorage from redirecting SSO traffic
 // (and the AWS credentials it returns) to an arbitrary server.
@@ -20,7 +22,7 @@ function sanitizeBackendUrl(raw: string | null | undefined): string {
 }
 
 const getBackendUrl = (): string => {
-  const envUrl = import.meta.env.VITE_SSO_BACKEND_URL as string | undefined;
+  const envUrl = config.ssoBackendUrl;
   const fromEnv = sanitizeBackendUrl(envUrl);
   if (fromEnv) return fromEnv;
   return sanitizeBackendUrl(localStorage.getItem('ssoBackendUrl'));
