@@ -10,6 +10,7 @@ import { useExportSnapshot } from '../hooks/useExportSnapshot';
 import { useImportSnapshot } from '../hooks/useImportSnapshot';
 import { config } from '../utils/config';
 import { redact } from '../utils/redact';
+import { DxToggle } from './DxToggle';
 
 export function TopBar({ onRefresh, onToggleChat, chatOpen, onStartTour }: { onRefresh: () => void; onToggleChat: () => void; chatOpen: boolean; onStartTour: () => void }) {
   const showCredentials = useTopologyStore((s) => s.credentialsModalOpen);
@@ -463,6 +464,8 @@ export function TopBar({ onRefresh, onToggleChat, chatOpen, onStartTour }: { onR
               <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
             </svg>
           </button>
+
+          <DxToggle onRefresh={onRefresh} />
 
           {config.bedrockEnabled && (
           <button data-tour="chat" onClick={onToggleChat} className={iconBtn(chatOpen)} title={chatOpen ? 'Hide chat' : 'Show chat'} aria-label={chatOpen ? 'Hide chat panel' : 'Show chat panel'} aria-pressed={chatOpen}>

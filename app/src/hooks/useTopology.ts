@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useTopologyStore } from '../store/topology-store';
 import { getMockTopology } from '../utils/mock-data';
 import { fetchAllTopologyData } from '../api/fetch-topology';
+import { getDxEnabled } from '../utils/dx-preference';
+import { withoutDx } from '../api/dx-optional';
 import { resolveAccountName } from '../api/organizations';
 import { buildGraph } from '../engine/topology-builder';
 import { applyLayout } from '../engine/layout-engine';
@@ -252,9 +254,11 @@ export function useTopology() {
     try {
       let topology;
       if (credentials && !useMock) {
-        topology = await fetchAllTopologyData(credentials);
+        topology = await fetchAllTopologyData(credentials, { dxEnabled: getDxEnabled() });
       } else {
         topology = getMockTopology(mockScenario);
+        // Demo data is DX-centric; honour the DX switch so the VPC-only view can be tried too.
+        if (!getDxEnabled()) topology = withoutDx(topology, { state: 'off' });
       }
 
       if (!isLatest()) return;

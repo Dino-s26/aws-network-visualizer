@@ -21,16 +21,19 @@ docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
 | Variable | Default | Purpose |
 |---|---|---|
 | `BEDROCK_ENABLED` | `false` | Show the Amazon Bedrock chat assistant (exact value `true`) |
+| `DX_ENABLED` | `true` | Direct Connect view. Skipped automatically if DX is unavailable; set `false` to never call DX APIs |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-opus-5` | Bedrock model for chat |
 | `BEDROCK_GUARDRAIL_ID`, `BEDROCK_GUARDRAIL_VERSION` | empty, `DRAFT` | Bedrock Guardrail (recommended when chat is on) |
 | `DEFAULT_REGION` | `us-east-1` | Region used for demo mode and as fallback |
 | `DEFAULT_SCENARIO` | `noResiliency` | Demo scenario: `noResiliency`, `devTest`, `high`, `maximum`, `crossAccount` |
-| `APP_TITLE` | `Network Resilience Agent` | Title in the top bar |
+| `APP_TITLE` | `AWS Network Visualizer` | Title in the top bar |
 | `SSO_BACKEND_URL` | empty | Optional SSO backend (see `app/docs/SETUP.md`) |
 | `MAX_TOOL_ROUNDS` | `5` | Max chat tool-use rounds per turn |
 | `CSP_CONNECT_EXTRA` | empty | Extra allowed origins for browser requests, space separated |
 
 Values are checked and restricted to safe characters when the container starts. The SSO backend origin is added to the Content-Security-Policy automatically.
+
+**Direct Connect is best-effort.** It is on by default. If the account has no Direct Connect, or the credentials lack permission, it is skipped quietly and only VPC resources are shown. The DX switch in the top bar turns it off completely (no Direct Connect API calls, no DX permissions needed). `DX_ENABLED=false` disables it for the whole deployment, and users cannot turn it back on.
 
 **Bedrock chat is off by default.** Turning it on needs Bedrock model access in your AWS account. Use a Bedrock Guardrail for anything beyond local testing.
 
