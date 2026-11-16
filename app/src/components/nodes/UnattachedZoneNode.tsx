@@ -46,7 +46,7 @@ export function UnattachedZoneNode({ id, data }: NodeProps) {
   const warnIconBg = light ? 'rgba(217,119,6,0.12)' : 'rgba(250,204,21,0.14)';
   const warnIconColor = light ? '#b45309' : '#fbbf24';
 
-  const vpcCols = { name: '26%', id: '22%', cidr: '18%', region: '18%', state: '16%' };
+  const vpcCols = { name: '22%', id: '26%', cidr: '20%', region: '18%', state: '14%' };
   const tgwCols = { name: '26%', id: '22%', asn: '14%', region: '22%', state: '16%' };
   const vgwCols = { name: '26%', id: '22%', asn: '14%', region: '22%', state: '16%' };
   const dxgwCols = { name: '34%', id: '30%', asn: '18%', state: '18%' };

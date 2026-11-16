@@ -17,6 +17,8 @@ import { fetchVpcs, fetchVpnGateways, fetchTransitGateways, fetchTransitGatewayA
 import { assumeRoleInAccount } from './organizations';
 import { fetchBgpPrefixMetrics } from './cloudwatch-dx';
 import { fetchDxMaintenanceEvents } from './health-dx';
+import { createDxProbe, dxSkipped, dxStatusFrom, loggedDx, stripDxData } from './dx-optional';
+import { config } from '../utils/config';
 
 /**
  * Run one resource fetch, recording failure instead of aborting the load.
@@ -52,8 +54,14 @@ function noteIssue(issues: FetchIssue[], label: string, kind: FetchIssueKind, me
   issues.push({ label, kind, message });
 }
 
-export async function fetchAllTopologyData(creds: AwsCredentials): Promise<TopologyData> {
+export async function fetchAllTopologyData(
+  creds: AwsCredentials,
+  options: { dxEnabled?: boolean } = {},
+): Promise<TopologyData> {
   const fetchIssues: FetchIssue[] = [];
+  // Direct Connect is best-effort: skipped (no calls, no banner) when turned off,
+  // denied, or unavailable. Its outcome rides out as TopologyData.dxStatus.
+  const dxProbe = createDxProbe(options.dxEnabled ?? config.dxEnabled);
 
   // --- Phase 1: Fetch global services (DX Gateways, Cloud WAN, Locations) ---
   // These APIs are global and work from any region.
@@ -75,7 +83,7 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
 
   const [dxGateways, cloudWanCoreNetworks, cloudWanAttachments, cloudWanPeerings] =
     await Promise.all([
-      logged('DxGateways', fetchDxGateways(dxClient), fetchIssues),
+      loggedDx('DxGateways', () => fetchDxGateways(dxClient), dxProbe),
       logged('CloudWanCoreNetworks', fetchCoreNetworks(nmClient), fetchIssues),
       logged('CloudWanAttachments', fetchCloudWanAttachments(nmClient), fetchIssues),
       logged('CloudWanPeerings', fetchCloudWanPeerings(nmClient), fetchIssues),
@@ -88,10 +96,10 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
     const regionDx = createDxClient(regionCreds);
     const regionEc2 = createEc2Client(regionCreds);
     const [rConns, rVifs, rLags, rLocs, rVpcs, rVpnGw, rTgws, rTgwAtt, rTgwPeering, rVpcPeerings, rVpnConns, rCgws, rVpcRouteTables] = await Promise.all([
-      logged(`${region}/Connections`, fetchConnections(regionDx), fetchIssues),
-      logged(`${region}/VirtualInterfaces`, fetchVirtualInterfaces(regionDx), fetchIssues),
-      logged(`${region}/Lags`, fetchLags(regionDx), fetchIssues),
-      logged(`${region}/Locations`, fetchLocations(regionDx), fetchIssues),
+      loggedDx(`${region}/Connections`, () => fetchConnections(regionDx), dxProbe),
+      loggedDx(`${region}/VirtualInterfaces`, () => fetchVirtualInterfaces(regionDx), dxProbe),
+      loggedDx(`${region}/Lags`, () => fetchLags(regionDx), dxProbe),
+      loggedDx(`${region}/Locations`, () => fetchLocations(regionDx), dxProbe),
       logged(`${region}/VPCs`, fetchVpcs(regionEc2, region), fetchIssues),
       logged(`${region}/VpnGateways`, fetchVpnGateways(regionEc2), fetchIssues),
       logged(`${region}/TransitGateways`, fetchTransitGateways(regionEc2), fetchIssues),
@@ -125,7 +133,7 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
     // DX Gateway associations (fan out per gateway, already parallel)
     Promise.all(
       dxGateways.map((g) =>
-        logged(`DxGwAssoc(${g.directConnectGatewayId})`, fetchDxGatewayAssociations(dxClient, g.directConnectGatewayId), fetchIssues)
+        loggedDx(`DxGwAssoc(${g.directConnectGatewayId})`, () => fetchDxGatewayAssociations(dxClient, g.directConnectGatewayId), dxProbe)
       )
     ).then((results) => results.flat()),
     // Cloud WAN routes
@@ -182,7 +190,7 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
   const allFetchedResults = [defaultRegionResult, ...extraRegionResults];
   const fetchedRegions = new Set([creds.region, ...discoveredRegions]);
   const attachmentRegionSets = await Promise.all(
-    dxGateways.map((g) => logged(`DxGwAttachmentRegions(${g.directConnectGatewayId})`, fetchDxGatewayAttachmentRegions(dxClient, g.directConnectGatewayId), fetchIssues))
+    dxGateways.map((g) => loggedDx(`DxGwAttachmentRegions(${g.directConnectGatewayId})`, () => fetchDxGatewayAttachmentRegions(dxClient, g.directConnectGatewayId), dxProbe))
   );
   const missingRegions = new Set<string>();
   for (const regions of attachmentRegionSets) {
@@ -335,8 +343,15 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
   // signal — peak hourly utilization over weeks — is only useful when the user
   // is actively looking at capacity. The "Show utilization" control in the
   // Live overlay calls fetchUtilizationOnDemand() below.
+  // Skip the DX-only extras (CloudWatch BGP metrics, AWS Health DX events) when DX
+  // is off, denied, or the account simply has no Direct Connect resources.
+  const hasDx = !(effectiveConnections.length === 0 && dxGateways.length === 0 && virtualInterfaces.length === 0);
+  const skipDxExtras = dxSkipped(dxProbe) || !hasDx;
   const [bgpPrefixMetrics, maintenanceEvents] = await Promise.all([
-    fetchBgpPrefixMetrics(creds, virtualInterfaces).catch((err) => {
+    (skipDxExtras
+      ? Promise.resolve(new Map() as NonNullable<TopologyData['bgpPrefixMetrics']>)
+      : fetchBgpPrefixMetrics(creds, virtualInterfaces)
+    ).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn('[AWS] BGP prefix metrics FAILED:', msg);
       // Recorded, not just warned. An empty metrics map silently disables the
@@ -345,7 +360,9 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
       noteIssue(fetchIssues, 'CloudWatch/BgpPrefixMetrics', 'failed', msg);
       return new Map() as NonNullable<TopologyData['bgpPrefixMetrics']>;
     }),
-    fetchDxMaintenanceEvents(creds, (label, maxPages) =>
+    (skipDxExtras
+      ? Promise.resolve([] as NonNullable<TopologyData['maintenanceEvents']>)
+      : fetchDxMaintenanceEvents(creds, (label, maxPages) =>
       // Health deliberately truncates rather than throwing, so this is the only
       // way the calendar's incompleteness becomes visible outside the console.
       noteIssue(
@@ -354,7 +371,7 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
         'truncated',
         `stopped after ${maxPages} pages; older entries are not shown`,
       ),
-    ).catch((err) => {
+    )).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn('[AWS] Health events FAILED:', msg);
       noteIssue(fetchIssues, 'Health/MaintenanceEvents', 'failed', msg);
@@ -506,6 +523,11 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
     }
     console.log(`[AWS] Enriched from spoke accounts: ${enrichedVpcs} VPCs, ${enrichedTgws} TGWs, ${enrichedTgwAtts} TGW attachments, ${enrichedVpcRts} VPC route tables`);
   }
+
+  const dxStatus = dxStatusFrom(dxProbe, hasDx);
+  topology.dxStatus = dxStatus;
+  // A partly denied Direct Connect must not drive a score from fragments of data.
+  if (dxStatus.state === 'unavailable') stripDxData(topology);
 
   // Attach last, so it captures issues from every phase including the spoke-
   // account enrichment above. Only set when non-empty: an empty array and

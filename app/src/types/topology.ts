@@ -105,6 +105,8 @@ export interface TopologyData {
    * snapshots taken before this existed still load.
    */
   fetchIssues?: FetchIssue[];
+  /** Direct Connect availability for this load. Undefined means ok (mock data, old snapshots). */
+  dxStatus?: DxStatus;
   /**
    * When VIF routes and this account's TGW route tables were last read TOGETHER
    * (ISO). Set by the live route fetch; the report prints it so a reader knows the
@@ -374,4 +376,13 @@ export interface AggregatedVifInfo {
   utilizationIngressBps?: number;
   utilizationEgressBps?: number;
   connectionBandwidth?: string;
+}
+
+/** Outcome of the best-effort Direct Connect fetch. */
+export interface DxStatus {
+  /** ok: data loaded. off: turned off, no calls made. none: account has no DX resources. unavailable: skipped (denied or unreachable). */
+  state: 'ok' | 'off' | 'none' | 'unavailable';
+  reason?: 'permission' | 'error';
+  /** Short human-readable detail, e.g. the denied IAM action. */
+  detail?: string;
 }

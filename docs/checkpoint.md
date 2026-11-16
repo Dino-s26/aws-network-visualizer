@@ -293,3 +293,191 @@ Sequencing: finish Phase 1 verification (docker test build, image build/smoke te
 - docs/checkpoint.md: replaced 2 literal occurrences of the user's local username path and local folder name with placeholders (working tree only). The old text still exists in committed history/main until the reworded file is committed.
 - Uncommitted set (user to commit): README.md, app/tests/docker/runtime-config.test.mjs (regex fix: main currently has 1 failing test), docs/checkpoint.md.
 - Still open: refresh stale status lines in docs/CLAUDE.md; CI (GitHub Actions); docker compose up test; optional container smoke test on the bumped build; Phase 2a.
+
+---
+# Checkpoint 16 (2026-11-14) - PIVOT: VPC observability first, Direct Connect becomes optional
+
+## User decisions
+- Focus shifts from DX resilience to VPC observability. Deliver first: (1) topology map (VPCs, subnets/AZs, TGW, peering, endpoints), (2) reachability trace A->B, (3) security posture (exposed SGs/NACLs, public paths). VPC Flow Logs traffic analysis NOT in first scope.
+- DX: add a toggle so DX can be turned off. Assumption to confirm: separate "Direct Connect" view, shown only when DX is enabled; default OFF (VPC-first); runtime flag DX_ENABLED + UI switch. DX off = no DX API calls, no DX permissions needed (least privilege).
+
+## Design principles
+- New code in new modules (src/vpc/*: model, api, engine, components); minimal edits to upstream files so upstream merges stay easy. No DX code deleted yet.
+- Normalized NetworkModel (accounts, regions, VPCs incl. secondary/IPv6 CIDRs, subnets+AZ, route tables+targets, IGW/NAT/EIP, ENIs, SGs, NACLs, endpoints, prefix lists, TGW+attachments+RT assoc/propagation, peering, VPN/VGW, flow-log config, firewall summary). Pure engines (posture rules, reachability) over this model, tested with fixtures.
+- Topology map: Region > VPC > AZ > Subnet containers, collapsed by default, expand per VPC, detail side panel. Own deterministic layout (no new library); upstream DX layout engine not reused.
+- Region scope: DX no longer reveals regions, so add a region picker (default = credential region, option "all enabled regions"), TTL cache to limit API calls. Multi-account: reuse upstream spoke-role enrichment idea.
+- Demo mode needs a synthetic VPC dataset (also used as test fixture): ~3 VPCs, subnets, TGW, peering, endpoints, deliberately risky SG/NACL.
+
+## Security posture rule ideas (pure rules, severity + link to node)
+- SG open to 0.0.0.0/0 or ::/0 on all ports or sensitive ports (22, 3389, DB ports), default SG with rules, unused SGs.
+- NACL allow-all, shadowed/ordered-wrongly rules, ephemeral-port gaps.
+- Internet-reachable ENIs (public IP/EIP + IGW route + open SG + permissive NACL); public subnets with no restriction.
+- Blackhole routes, missing return routes (peering/TGW), overlapping CIDRs across peers, unassociated route tables, TGW attachments without propagation.
+- VPC Flow Logs not enabled (DescribeFlowLogs; config check only).
+
+## Revised phases
+- 2a data layer + model + TTL cache + region picker + DX_ENABLED plumbing + synthetic dataset
+- 2b topology map v1 (nodes, layout, expand/collapse, detail panel)
+- 2c security posture engine + findings panel + tests
+- 2d reachability core (RT, SG, NACL, TGW, peering, VPN) + panel; 2e IGW/NAT, endpoints, Network Firewall (INCONCLUSIVE when not statically evaluable)
+- 3 UI/UX settings, reduced motion, persistent cache (off by default); 4 optional Flow Logs analysis, SQLite history
+- Also: neutral default title, README repositioned as "VPC observability, optional Direct Connect view", update CLAUDE.md and README roadmap after plan approval.
+
+## Risks
+- Scale (hundreds of VPCs / thousands of SGs): collapse-by-default, onlyRenderVisibleElements, paging, cache. Cross-account SG/NACL access needs per-account read roles. Reachability remains the most complex part.
+- Status: plan awaiting user approval; nothing implemented for the pivot yet.
+
+---
+# Checkpoint 17 (2026-11-14) - DX best-effort: enabled by default, skipped quietly when unavailable
+
+## User context
+DX stays ON by default. If DX resources are unavailable (none in account, missing permission, API error), skip DX and show only VPC resources. Toggle still lets the user turn DX fully off. Landing view = VPC view; DX view appears only when DX data exists.
+
+## Upstream behavior found (read-only)
+- api/fetch-topology.ts: every fetch goes through logged(name, promise, issues): catches errors, pushes FetchIssue {label, kind 'failed'|'truncated', message}, returns []. One failed service does not blank the topology. Issues ride out on TopologyData.fetchIssues and drive IncompleteDataBanner (persistent warning that says a permissions gap is the usual cause; fetch-issues.ts extracts the denied action).
+- So DX failure already degrades gracefully, BUT it shows a "failed to load / incomplete data" banner, which is the wrong message for an expected "no DX here".
+- Abort heuristic (~line 322): throws "Invalid AWS credentials" only if an issue message matches an auth pattern (includes AccessDenied) AND connections, DX gateways and VPCs are all empty. A DX-only denial with VPCs present does not abort; an account with no VPCs in scanned regions + DX denied would get a misleading credentials error. Better signal: STS GetCallerIdentity failure (callerAccountId === '').
+- Regions are discovered from DXGW associations + Cloud WAN + DX attachment regions. With DX empty/skipped there is no region source -> need the region picker.
+- DX-only extras that must also be skipped: CloudWatch BGP metrics, AWS Health DX maintenance events, DX route tables/panels, resilience engine, score card, report export.
+
+## Slice 2a-1 (proposed first implementation step, small)
+1. Config: DX_ENABLED (runtime + VITE_DX_ENABLED), default true; UI toggle in settings/top bar; false = zero DX API calls and no DX IAM permissions needed.
+2. New FetchIssueKind 'skipped' (types/topology.ts) with reason: none-found | no-permission | unsupported | error. loggedOptional() wrapper for DX calls; fetch-issues.ts and IncompleteDataBanner treat 'skipped' as informational (not counted as failed, no scary banner); small "Direct Connect: skipped (reason)" status chip.
+3. Replace the credentials-abort heuristic with an STS-based check; VPC data presence no longer decides it.
+4. Skip DX phases (Phase 1 DX gateways, 3b attachment regions, BGP metrics, Health events) when disabled or when DX returns nothing/denied; keep Cloud WAN behavior unchanged unless it proves DX-coupled.
+5. Region source when DX gives none: user region picker (default = credential region, option all enabled regions).
+6. Tests: unit tests for kind classification (AccessDenied vs empty vs other), DX_ENABLED off => no DX client calls, STS-based abort. Reuse upstream fetch tests' mocking style (src/api/__tests__).
+Then 2a-2: normalized VPC NetworkModel + fetchers + synthetic dataset.
+
+---
+# Checkpoint 18 (2026-11-14) - Slice 2a-1 (backend/config part) done: DX best-effort, no UI yet
+
+## Verified
+- Container test stage: 93 files / 1386 tests PASS (was 1367; +19 new). Production build incl. tsc -b: OK. Nothing committed or staged by Claude. Container runtime smoke test not re-run on this build.
+
+## Implemented
+- NEW app/src/api/dx-optional.ts: classifyDxError (permission | credentials | unreachable | error), DxProbe, loggedDx (thunk-based, never calls when DX off or already denied, never writes FetchIssue), dxSkipped, dxStatusFrom -> DxStatus {state ok|off|none|unavailable, reason?, detail?}.
+- NEW app/src/api/__tests__/dx-optional.test.ts (classification, skip/stop-after-denial, unreachable region, status rules).
+- app/src/api/fetch-topology.ts: fetchAllTopologyData(creds, options {dxEnabled?}) defaults to config.dxEnabled; all DX calls (DxGateways, per-region Connections/VIFs/Lags/Locations, DxGwAssoc, DxGwAttachmentRegions) go through loggedDx; BGP metrics and Health DX events skipped when DX skipped or no DX resources; topology.dxStatus set before fetchIssues attach. fetchIssues/banner untouched: DX never raises the "incomplete data" banner.
+- app/src/types/topology.ts: TopologyData.dxStatus?: DxStatus + DxStatus type.
+- Config: config.dxEnabled (runtime dxEnabled > VITE_DX_ENABLED > default true; only exact "false" disables). docker/40-runtime-config.sh writes dxEnabled (DX_ENABLED env, default true). Updated vite-env.d.ts, .env.example, docker-compose.yml comment, README env table, runtime-config + config tests.
+- Plan correction recorded: upstream already sweeps all enabled regions (DescribeRegions), so region discovery does not depend on DX; a region picker is optional scope-limiting only. STS-based credentials check dropped: DX failures no longer enter fetchIssues, so a DX-only denial cannot trigger the "invalid credentials" abort.
+
+## Known limits / follow-ups
+- UI not wired yet: no DX on/off toggle, no status chip, DX-only panels (ResiliencyScoreCard, report DX sections) still render from whatever data exists. Needed: hide DX-only UI when dxStatus.state is not ok; consider a pure withoutDx(topology) to drop partial DX data when state is unavailable (a partly-denied DX could otherwise show a misleading score; upstream banner comment warns that empty can read as pass).
+- Cloud WAN (networkmanager) failures still raise normal "failed" issues; could be made optional the same way if VPC-only users hit noise.
+- Demo/mock scenarios are DX-centric and have no dxStatus (treated as ok).
+- Uncommitted: all of the above plus earlier README/test-fix/docs changes.
+
+## Next: slice 2a-1 UI step
+1. Small localStorage-backed preference (src/utils/dx-preference.ts + hook) for the DX toggle; loadTopology passes { dxEnabled }.
+2. Toggle + DX status chip in the top bar (tooltip with reason/detail); toggling refreshes.
+3. Gate DX-only UI on dxStatus; add withoutDx where needed. Tests for the pure parts.
+Then 2a-2: normalized VPC NetworkModel + fetchers + synthetic dataset.
+
+---
+# Checkpoint 19 (2026-11-14) - DX UI step done; new image built; previous image deleted
+
+## Verified
+- Container test stage: 94 files / 1400 tests PASS (+14 new). Production build incl. tsc -b: OK. Nothing committed or staged by Claude.
+- New image aws-network-visualizer:dev = sha256:4e9197dea46d..., 62.2 MB. Previous :dev image sha256:71df5b0b2a13... DELETED at user request (docker rmi of that single ID).
+- Runtime smoke test and browser/UI check NOT yet done on this image.
+
+## Implemented (UI step of slice 2a-1)
+- src/utils/dx-preference.ts: localStorage preference (key nwv-dx-enabled) + in-memory fallback + useSyncExternalStore hook. Effective value = config.dxEnabled && preference != off: deployment DX_ENABLED=false is a hard lock the user cannot override.
+- src/components/DxToggle.tsx + TopBar: always-visible chip/switch (on / off / none found / skipped), tooltip with reason, aria-label, disabled when locked; toggling refreshes the topology (note: refresh clears user-drawn edits, as upstream refresh does).
+- src/api/dx-optional.ts additions: isDxActive, stripDxData (mutating), withoutDx (copy), describeDx (chip text/tone). fetch-topology strips partial DX data when dxStatus is unavailable.
+- useTopology.ts: passes { dxEnabled: getDxEnabled() } to the fetch; demo/mock data is passed through withoutDx when DX is off.
+- README: DX best-effort paragraph + DX_ENABLED row. Tests: dx-optional (+isDxActive/strip/withoutDx/describeDx), dx-preference (default, saved off, persist+notify, locked by deployment, broken storage).
+
+## Open / to check manually
+- Browser: chip renders and toggles; demo mode with DX off still renders a sane VPC/TGW canvas (upstream supports non-DX estates but not visually confirmed); ResiliencyScoreCard behavior with zero DX gateways.
+- Image housekeeping: two older project images still present (sha256:61e44d71..., sha256:9a90e440..., ~62 MB each) plus 6 dangling images in total (rest likely test-stage builds). Not deleted; awaiting user decision.
+- Still uncommitted: all work since PR #4 (README, tests, DX best-effort backend + UI, checkpoints).
+
+## Next
+- User check of new image in browser (or Claude smoke test via docker run); then commit/PR.
+- Then slice 2a-2: normalized VPC NetworkModel + fetchers + synthetic dataset, then 2b topology map.
+
+---
+# Checkpoint 20 (2026-11-14) - new image running; first live-account look
+
+## State
+- User started container nwv-new from the new image (aws-network-visualizer:dev, 4e9197dea46d, 62.2 MB) on 127.0.0.1:8080: running, healthy. Served /config.js has dxEnabled true, bedrockEnabled false; no DX_ENABLED / BEDROCK_ENABLED env set. Stop with: docker rm -f nwv-new
+- Nothing committed by Claude. All work since PR #4 is still uncommitted (README, tests, DX best-effort backend + UI, checkpoints, CLAUDE.md edits).
+- Screenshot from the user's browser contained a real account ID and real VPC IDs/names: NOT recorded here. Reminder: keep such screenshots out of public places (issues, PRs).
+
+## Observations from the live-account screenshot (no identifiers)
+- Live scan works end to end with Access Key login: VPCs found across 18 regions (region sweep confirmed, DX not needed).
+- Every VPC is a default VPC (172.31.0.0/16), one per region, and all land in a single "Unattached resources" table, because upstream's canvas is built around DX paths. Tabs (Live / Utilization / Recommendation), the Resilience Status card and the minimap are DX-shaped. Confirms the need for the VPC topology map (2b).
+- Chip showed "DX off" although the deployment serves dxEnabled true. Expected "DX: none found" if DX were on. Most likely the browser-saved preference (nwv-dx-enabled = 0, e.g. from an earlier click). TEST PENDING: click the chip once, expect refresh and "DX: none found" or "DX on". If it stays "DX off", investigate as a bug (check dx-preference / describeDx / dxStatus path).
+- CIDR and VPC ID columns are truncated in the Unattached table (UI fix). Default title still "Network Resilience Agent" (change default to neutral).
+- New posture rule candidate for 2c: unused default VPC present in every region (CIS suggests removing unused default VPCs); plus default SG with rules.
+
+## Open items
+1. Click test on the DX chip (user) and report what it shows.
+2. Expand Resilience Status card with zero DX gateways: what does it show? (is the score meaningful or misleading?)
+3. Demo mode with DX off: does the VPC/TGW-only canvas look sane?
+4. Image housekeeping: two older project images (61e44d71..., 9a90e440..., ~62 MB each) and 6 dangling images in total remain; not deleted, awaiting user decision. Dangling images may belong to other projects; do not bulk prune without listing.
+5. docs/CLAUDE.md "Phases and status" lines are stale; refresh with next checkpoint.
+6. Commit + PR (user runs git). Consider CI (GitHub Actions: test stage, image build, GHCR).
+7. Optional: make Cloud WAN fetch failures optional like DX if VPC-only users see banner noise.
+
+## Next (proposed)
+Slice 2a-2: normalized VPC NetworkModel + fetchers + synthetic dataset (+ quick fixes: neutral default title, column widths), then 2b topology map, 2c security posture, 2d reachability.
+
+---
+# Checkpoint 21 (2026-11-15) - session resumed; branch created; CLAUDE.md refreshed; 2a-2 part 1 (model + demo data)
+
+## Repo state found at start of session
+- main = 991ecd6 "Feat: Phase-1/Update dockerize (#5)" (PR #5 merged by user). DX best-effort work (slice 2a-1) was still uncommitted and sitting on main.
+- Created branch feat/dx-best-effort (git switch -c; working changes carried over). Nothing committed, nothing pushed by Claude.
+- Pre-commit scan of changed/new files: clean (no secrets, credential-like strings, local paths, account-ID patterns, files > 1 MB).
+
+## Done this session
+- docs/CLAUDE.md rewritten: VPC observability first, DX best-effort, commands, conventions (new code under app/src/vpc/, test placement, all-or-nothing edit scripts, never write real identifiers), current phases/status.
+- Quick fixes: default title now "AWS Network Visualizer" (config.ts default, index.html <title>, 2 test assertions, README table); Unattached VPC table columns rebalanced (name 22, id 26, cidr 20, region 18, state 14 percent). Long IDs may still clip: the box has a fixed width.
+- Slice 2a-2 part 1 (pure data/logic, no AWS calls):
+  - app/src/vpc/model.ts: NetworkModel (VpcNet, Subnet, RouteTable/Route, SecurityGroup/SgRule, NetworkAcl/NaclEntry, NetworkInterface, InternetGateway, NatGateway, VpcEndpoint, PrefixList, Tgw, TgwAttachment, TgwRouteTable, PeeringConnection, FlowLog).
+  - app/src/vpc/lookup.ts: indexModel (maps by id, subnetsByVpc, enisBySubnet, effective route table per subnet with main-table fallback, NACL per subnet), isPublicSubnet.
+  - app/src/vpc/demo-data.ts: getDemoNetworkModel(), documentation-safe values only (account 111122223333, 10.x, 203.0.113.0/24, 198.51.100.0/24, IDs containing "demo"). Deliberate findings: SSH open to internet on public ENI; one-way peering route; blackhole routes (VPC RT and TGW RT); unused default VPC; flow logs only on prod; unused SG open on 3389.
+  - app/src/vpc/__tests__/model.test.ts: safety, internal consistency, lookup helpers, and the deliberate findings.
+
+## Verified
+- Container test stage: 95 files / 1416 tests PASS (+16). Production build incl. tsc: OK. New image aws-network-visualizer:dev = d6994a1600db, 62.2 MB.
+- Container nwv-new (started this session on 127.0.0.1:8080, healthy) still runs the PREVIOUS image 4e9197dea46d (title/column fixes not visible there until restarted on the new image).
+
+## Open
+- DX chip click test (user): what does the chip read before/after one click?
+- Restart nwv-new on the new image and delete superseded images (4e9197dea46d after restart; older 61e44d71..., 9a90e440...; 6+ dangling in total). Awaiting user decision.
+- Resilience Status card with zero DX gateways; demo mode with DX off: not checked.
+- All work since PR #5 uncommitted on feat/dx-best-effort (user commits).
+
+## Next
+- 2a-2 part 2: fetchers that fill NetworkModel from AWS (DescribeSubnets, RouteTables, SecurityGroups, NetworkAcls, NetworkInterfaces, InternetGateways, NatGateways, VpcEndpoints, ManagedPrefixLists + entries, FlowLogs, TGW attachments/route tables/associations, peering), using upstream's bounded pagination helper and logged() issue tracking; mapper unit tests with canned responses; extra read-only IAM policy documented.
+- Then 2b topology map (wire demo model into a new VPC view).
+
+---
+# Checkpoint 22 (2026-11-15) - DX toggle confirmed; empty-state notice fixed; image rebuilt; old images removed
+
+## User verification (screenshots, demo mode; no identifiers recorded)
+- DX chip toggles both ways: "DX on" (green, tooltip "Direct Connect is on. Click to turn it off and refresh.") and "DX off" (grey, tooltip "Direct Connect is turned off, so no Direct Connect API calls are made..."). No bug; yesterday's "DX off" was the saved browser preference.
+- Demo mode with DX off renders a sane VPN/VGW/VPC canvas plus the Unattached resources zone.
+- Found: upstream EmptyStateBanner said "No Direct Connect resources found" even when DX was merely turned off (not checked). Fixed below.
+- Session timeout banner (15 min inactivity) works; after expiry the app falls back to the demo scenario.
+
+## Done
+- app/src/api/dx-optional.ts: dxEmptyStateCopy(status, hasOtherResources) -> heading/body/hint for off ("Direct Connect is turned off", "was not checked") and unavailable ("Direct Connect was skipped", reason + fix); null for none/ok/unknown so upstream's text stays for a genuinely DX-less account.
+- app/src/components/EmptyStateBanner.tsx uses it (heading, body, hint). Tests added in dx-optional.test.ts.
+- Verified: container test stage 95 files / 1420 tests PASS; production build incl. tsc OK.
+- New image aws-network-visualizer:dev = 23aade5235cd (62.2 MB). Container nwv-new restarted on it: 127.0.0.1:8080, healthy, served title "AWS Network Visualizer".
+- Removed 4 superseded final images of this project (4e9197dea46d, 61e44d715419, 9a90e440aaa8, d6994a1600db), identified by build history containing 40-runtime-config.sh. First deletion pass matched nothing (faulty filter over all images); second pass over dangling images worked.
+
+## Open
+- 6 dangling test-stage builds of this project remain (about 430 MB each nominal, layers shared); listed, not deleted. Awaiting user decision. To stop accumulating them, run the test stage without exporting an image: docker build -f docker/Dockerfile --target test --output type=cacheonly .  (to verify, then update README/CLAUDE.md commands).
+- Not yet visually confirmed by user on the new image: notice text with DX off, new title, wider VPC ID/CIDR columns.
+- Resilience Status card with zero DX gateways on a live account: unchecked.
+- All work since PR #5 still uncommitted on feat/dx-best-effort (user commits). Suggested split: (1) DX best-effort + notice fix, (2) title/columns quick fixes, (3) VPC model + demo data; or one commit.
+
+## Next
+- 2a-2 part 2: AWS fetchers filling NetworkModel (bounded pagination, logged() issue tracking), mapper tests with canned responses, extra read-only IAM policy documented. Then 2b topology map.
