@@ -2340,6 +2340,8 @@ export function applyLayout(
       positioned.set(id, {
         ...node,
         parentId: region.id,
+        // Dragging a node to the region's edge grows the region (see utils/container-fit.ts).
+        expandParent: true,
         position: {
           x: node.position.x - regionNode.position.x,
           y: node.position.y - regionNode.position.y,
@@ -2357,6 +2359,8 @@ export function applyLayout(
       positioned.set(id, {
         ...node,
         parentId: 'aws-cloud',
+        // Same for the AWS box: it grows when a region or gateway is dragged to its edge.
+        expandParent: true,
         position: {
           x: node.position.x - awsCloudPositioned.position.x,
           y: node.position.y - awsCloudPositioned.position.y,
