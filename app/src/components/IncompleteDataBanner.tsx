@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 import { useTopologyStore } from '../store/topology-store';
 import { useIsLight } from '../hooks/useTheme';
 import { COLORS } from '../utils/colors';
 import type { TopologyData } from '../types/topology';
 import { summariseIssues, guidanceFor } from '../utils/fetch-issues';
+import { COMPACT_AT, describeGroup, groupIssues, maskIdentifiers } from '../utils/issue-display';
 
 /**
  * Persistent notice that the loaded topology is missing data.
@@ -26,6 +27,12 @@ import { summariseIssues, guidanceFor } from '../utils/fetch-issues';
  * topology so a shared screenshot or an exported report is never taken from a
  * view that silently hid this. Refreshing or switching account/scenario
  * replaces `topologyData`, which is what clears it.
+ *
+ * Readability: one blocked region produces a failure per service, so a long list
+ * of near-identical rows is summarised by cause first (see issue-display.ts) and
+ * the per-call rows are tucked behind a button once there are more than
+ * COMPACT_AT. Messages are shown with account and identity details masked, since
+ * this banner is the thing people screenshot; a toggle reveals the raw text.
  */
 export function IncompleteDataBanner() {
   const topologyData = useTopologyStore((s) => s.topologyData);
@@ -37,6 +44,11 @@ export function IncompleteDataBanner() {
   // account switch re-expands it for the new context.
   const [collapsedFor, setCollapsedFor] = useState<TopologyData | null>(null);
   const collapsed = topologyData != null && collapsedFor === topologyData;
+  // Same keying: a new load starts with the list closed and identifiers masked.
+  const [listFor, setListFor] = useState<TopologyData | null>(null);
+  const [revealFor, setRevealFor] = useState<TopologyData | null>(null);
+  const showList = topologyData != null && listFor === topologyData;
+  const reveal = topologyData != null && revealFor === topologyData;
 
   const issues = topologyData?.fetchIssues ?? [];
 
@@ -45,8 +57,22 @@ export function IncompleteDataBanner() {
   if (issues.length === 0) return null;
 
   const guidance = guidanceFor(issues);
+  const groups = groupIssues(issues);
+  const compact = issues.length > COMPACT_AT;
+  const showRows = !compact || showList;
+  const show = (message: string) => (reveal ? message : maskIdentifiers(message));
+  const hasMasked = issues.some((i) => maskIdentifiers(i.message) !== i.message);
 
   const amber = COLORS.severity.warning;
+  const smallButton: CSSProperties = {
+    background: 'transparent',
+    border: `1px solid ${amber}`,
+    borderRadius: 4,
+    color: 'inherit',
+    cursor: 'pointer',
+    fontSize: 11,
+    padding: '1px 6px',
+  };
 
   return (
     <div
@@ -57,6 +83,8 @@ export function IncompleteDataBanner() {
         borderRadius: 8,
         padding: '10px 12px',
         maxWidth: 460,
+        maxHeight: 'calc(100vh - 140px)',
+        overflowY: 'auto',
         fontSize: 12,
         color: light ? '#78350F' : '#FDE68A',
         boxShadow: '0 2px 8px rgba(0,0,0,0.18)',
@@ -74,15 +102,7 @@ export function IncompleteDataBanner() {
           type="button"
           onClick={() => setCollapsedFor(collapsed ? null : (topologyData ?? null))}
           aria-expanded={!collapsed}
-          style={{
-            background: 'transparent',
-            border: `1px solid ${amber}`,
-            borderRadius: 4,
-            color: 'inherit',
-            cursor: 'pointer',
-            fontSize: 11,
-            padding: '1px 6px',
-          }}
+          style={smallButton}
         >
           {collapsed ? 'Details' : 'Hide'}
         </button>
@@ -97,20 +117,70 @@ export function IncompleteDataBanner() {
             that failed to load is indistinguishable from one that does not
             exist, so some checks may report no finding rather than “unknown”.
           </div>
-          <ul style={{ margin: '6px 0 0', paddingLeft: 18, lineHeight: 1.5 }}>
-            {issues.map((issue) => (
-              <li key={`${issue.kind}:${issue.label}`}>
-                <code style={{ fontSize: 11 }}>{issue.label}</code>
-                {issue.kind === 'truncated' ? ' — incomplete: ' : ' — failed: '}
-                {issue.message}
-              </li>
-            ))}
-          </ul>
+
+          {groups.length > 0 && (
+            <ul style={{ margin: '6px 0 0', paddingLeft: 18, lineHeight: 1.5 }}>
+              {groups.map((g) => (
+                <li key={g.cause}>{describeGroup(g)}</li>
+              ))}
+            </ul>
+          )}
+
           {guidance.map((line) => (
             <div key={line} style={{ marginTop: 6, opacity: 0.9 }}>
               {line}
             </div>
           ))}
+
+          {compact && (
+            <div style={{ marginTop: 8 }}>
+              <button
+                type="button"
+                onClick={() => setListFor(showList ? null : (topologyData ?? null))}
+                aria-expanded={showList}
+                style={smallButton}
+              >
+                {showList ? 'Hide technical details' : `Show all ${issues.length} technical details`}
+              </button>
+            </div>
+          )}
+
+          {showRows && (
+            <>
+              <ul
+                style={{
+                  margin: '6px 0 0',
+                  paddingLeft: 18,
+                  lineHeight: 1.5,
+                  maxHeight: '40vh',
+                  overflowY: 'auto',
+                }}
+              >
+                {issues.map((issue) => (
+                  <li key={`${issue.kind}:${issue.label}`}>
+                    <code style={{ fontSize: 11 }}>{issue.label}</code>
+                    {issue.kind === 'truncated' ? ' — incomplete: ' : ' — failed: '}
+                    {show(issue.message)}
+                  </li>
+                ))}
+              </ul>
+              {hasMasked && (
+                <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <button
+                    type="button"
+                    onClick={() => setRevealFor(reveal ? null : (topologyData ?? null))}
+                    aria-pressed={reveal}
+                    style={smallButton}
+                  >
+                    {reveal ? 'Hide account and role details' : 'Show account and role details'}
+                  </button>
+                  <span style={{ opacity: 0.8 }}>
+                    {reveal ? 'Showing raw messages.' : 'Masked so a shared screenshot does not expose them.'}
+                  </span>
+                </div>
+              )}
+            </>
+          )}
         </>
       )}
     </div>
