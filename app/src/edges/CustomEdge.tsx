@@ -10,6 +10,7 @@ import { VifRoutePanel } from '../components/nodes/VifRoutePanel';
 import { TagMarker } from '../components/nodes/TagMarker';
 import { edgeMatchesTag } from '../engine/tag-filter';
 import { isUserDrawnPair } from '../utils/user-edges';
+import { collapseLabelLines, estimateLabelHalfHeight, EXPANDED_MAX_HEIGHT } from '../utils/label-lines';
 
 function useNodeCategory(nodeId: string): string | undefined {
   return useTopologyStore((s) => {
@@ -135,6 +136,10 @@ export function CustomEdge({
   };
   const vifType = data?.vifType as 'private' | 'transit' | 'public' | undefined;
   const label = data?.label as string | undefined;
+  // A long prefix list collapses to a few lines with a "+N more" toggle (see utils/label-lines.ts).
+  const [prefixesExpanded, setPrefixesExpanded] = useState(false);
+  const labelView = label ? collapseLabelLines(label.split('\n'), prefixesExpanded) : null;
+  const labelScrolls = prefixesExpanded && !!labelView?.collapsible;
   const labelPosition = (data?.labelPosition as number | undefined) ?? 0.5;
   const tunnels = data?.tunnels as { outsideIpAddress: string; status: 'UP' | 'DOWN' }[] | undefined;
   const connectionState = data?.connectionState as string | undefined;
@@ -330,7 +335,9 @@ export function CustomEdge({
   let avoidY = baseLabelY;
   if (!labelOffset && label && !isSimulating && bowY === 0) {
     const LABEL_HALF_W = 80; // approximate half-width — caps at the 160px max-width we set on the label box
-    const LABEL_HALF_H = 14; // approximate half-height
+    // Real half-height. A long prefix list is far taller than the single line this used to assume,
+    // which let it "fit" on top of nodes and zones.
+    const LABEL_HALF_H = labelView ? estimateLabelHalfHeight(labelView.lines.length, prefixesExpanded) : 14;
     const PAD = 4;           // minimum breathing room around the label
 
     const rfState = storeApi.getState();
@@ -708,12 +715,14 @@ export function CustomEdge({
                 ? `0 0 0 3px ${COLORS.existing.edge}${light ? '2e' : '40'}, 0 2px 10px rgba(139,92,246,0.35)`
                 : light ? '0 1px 2px rgba(15,23,42,0.06), 0 2px 8px rgba(15,23,42,0.06)' : undefined,
               borderRadius: 6,
-              zIndex: 1001,
+              zIndex: labelScrolls ? 1050 : 1001,
               cursor: isSimulating ? undefined : isLocked ? 'text' : 'grab',
               userSelect: isLocked && !isSimulating ? 'text' : 'none',
               pointerEvents: 'all',
               opacity: isEdgeDimmed ? dimOpacityFor('edgeLabel', light) : isRouteDiffMuted ? 0.35 : 1,
               maxWidth: hasUtilRow || hasPrefixRow ? 220 : 180,
+              maxHeight: labelScrolls ? EXPANDED_MAX_HEIGHT : undefined,
+              overflowY: labelScrolls ? 'auto' : undefined,
               overflowWrap: 'anywhere',
             }}
             onPointerDown={onPointerDown}
@@ -723,7 +732,7 @@ export function CustomEdge({
             onMouseLeave={onLabelLeave}
           >
             {label ? (
-              label.split('\n').map((line, i) => {
+              (labelView?.lines ?? label.split('\n').map((text, index) => ({ text, index }))).map(({ text: line, index: i }) => {
                 const isStatusLine = /^(VIF|BGP|State):\s/i.test(line);
                 if (!showLiveStatus && isStatusLine) return null;
                 const sColor = statusColorOf(line.split(':').slice(1).join(':'));
@@ -747,6 +756,32 @@ export function CustomEdge({
                 );
               })
             ) : null}
+
+            {labelView?.collapsible && (
+              <button
+                type="button"
+                aria-expanded={prefixesExpanded}
+                aria-label={prefixesExpanded ? 'Show fewer prefixes' : `Show ${labelView.hidden} more prefixes`}
+                // Keep the click from starting a label drag or a canvas pan.
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPrefixesExpanded((v) => !v);
+                }}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'inherit',
+                  cursor: 'pointer',
+                  fontSize: 9,
+                  opacity: 0.85,
+                  padding: '2px 0',
+                  textDecoration: 'underline',
+                }}
+              >
+                {prefixesExpanded ? 'Show fewer' : `+${labelView.hidden} more`}
+              </button>
+            )}
 
             {hasDetailRows && (
               <div className="flex flex-col gap-0.5 mt-0.5">
