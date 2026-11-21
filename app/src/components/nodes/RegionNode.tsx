@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from 'react';
-import type { NodeProps } from '@xyflow/react';
+import { NodeResizer, type NodeProps } from '@xyflow/react';
 import type { DxNodeData } from '../../types/topology';
 import { COLORS } from '../../utils/colors';
 import { useTopologyStore } from '../../store/topology-store';
@@ -56,6 +56,16 @@ export function RegionNode({ id, data }: NodeProps) {
   }, [regionCode, toggleShowNonDxVpcs]);
 
   return (
+    <>
+      {/* Resizable by hand while the canvas is unlocked; also grows when a child is dragged to its edge. */}
+      <NodeResizer
+        minWidth={240}
+        minHeight={160}
+        isVisible={!isLocked && !d.isRecommended}
+        color={light ? '#38bdf8' : '#0891b2'}
+        handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
+        lineStyle={{ borderWidth: 1 }}
+      />
     <div
       className="rounded-xl pointer-events-none"
       style={{
@@ -170,5 +180,6 @@ export function RegionNode({ id, data }: NodeProps) {
         <ZoneFailButton zoneId={id} zoneType="region" zoneKey={regionCode} failed={failed} />
       )}
     </div>
+    </>
   );
 }

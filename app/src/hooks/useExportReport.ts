@@ -5,6 +5,7 @@ import type { DxConnection, DxVirtualInterface, VifRoute } from '../types/aws-re
 import type { CombinedAssessment, Recommendation, ResiliencyLevel, TgwAssessment } from '../types/recommendations';
 import { getLocationDeviceCounts, getLocationLinkCounts, meetsMaximumTier, maximumTierGapLocations } from '../engine/sla-gating';
 import { summariseIssues, guidanceFor } from '../utils/fetch-issues';
+import { maskIdentifiers } from '../utils/issue-display';
 import { analyzeTopology, groupTgwsByFeeders } from '../engine/recommendation-engine';
 import { assessTgwRouteResilience, type PrefixGrade } from '../engine/tgw-route-resilience';
 import {
@@ -2244,7 +2245,7 @@ export function renderIncompleteDataNoticeHtml(topology: TopologyData): string {
   const rows = issues
     .map(
       (i) =>
-        `<li><code>${escapeHtml(i.label)}</code> — ${i.kind === 'truncated' ? 'incomplete' : 'failed'}: ${escapeHtml(i.message)}</li>`,
+        `<li><code>${escapeHtml(i.label)}</code> — ${i.kind === 'truncated' ? 'incomplete' : 'failed'}: ${escapeHtml(maskIdentifiers(i.message))}</li>`,
     )
     .join('\n      ');
 

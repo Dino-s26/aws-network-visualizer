@@ -39,6 +39,7 @@ import { RegionNode } from './nodes/RegionNode';
 import { UnattachedZoneNode } from './nodes/UnattachedZoneNode';
 import { HiddenAssocZoneNode } from './nodes/HiddenAssocZoneNode';
 import { AwsCloudNode } from './nodes/AwsCloudNode';
+import { growContainersToFit, shouldApplyDimensionChange } from '../utils/container-fit';
 import { PublicResourcesNode } from './nodes/PublicResourcesNode';
 import { CustomEdge } from '../edges/CustomEdge';
 import { LayersPanel } from './LayersPanel';
@@ -327,6 +328,14 @@ export function FlowCanvas() {
     return new Set(base.filter((n) => n.data.category === 'dxLocation').map((n) => n.id));
   }, [viewMode, currentNodes, recommendedNodes, recommendedCurrentNodes]);
 
+  // The AWS box and the region boxes: resizable by hand, and they grow when a child is dragged to their edge.
+  const awsContainerIds = useMemo(() => {
+    const base = viewMode === 'recommended' && recommendedCurrentNodes.length > 0
+      ? [...recommendedCurrentNodes, ...recommendedNodes]
+      : currentNodes;
+    return new Set(base.filter((n) => n.data.category === 'awsCloud' || n.data.category === 'region').map((n) => n.id));
+  }, [viewMode, currentNodes, recommendedNodes, recommendedCurrentNodes]);
+
   const userCustomerSiteIds = useMemo(
     () => new Set(userCustomerSites.map((s) => s.id)),
     [userCustomerSites],
@@ -359,7 +368,18 @@ export function FlowCanvas() {
         .filter((c): c is NodeChange & { type: 'dimensions'; id: string; dimensions: { width: number; height: number }; resizing: boolean } => {
           if (c.type !== 'dimensions') return false;
           const rec = c as unknown as Record<string, unknown>;
-          return rec.dimensions != null && rec.resizing === true && (customerSiteIds.has(c.id) || userCustomerSiteIds.has(c.id) || dxLocationIds.has(c.id));
+          return shouldApplyDimensionChange(
+            {
+              id: c.id,
+              dimensions: rec.dimensions,
+              resizing: rec.resizing as boolean | undefined,
+              setAttributes: rec.setAttributes as boolean | undefined,
+            },
+            {
+              resizable: { has: (id: string) => customerSiteIds.has(id) || userCustomerSiteIds.has(id) || dxLocationIds.has(id) },
+              expandable: awsContainerIds,
+            },
+          );
         })
         .map((c) => ({ id: c.id, width: c.dimensions.width, height: c.dimensions.height }));
       if (dimChanges.length > 0) {
@@ -369,7 +389,7 @@ export function FlowCanvas() {
         if (otherDims.length > 0) updateNodeDimensions(otherDims);
       }
     },
-    [updateNodePositions, updateNodeDimensions, customerSiteIds, dxLocationIds, userCustomerSiteIds, userOnPremiseIds, updateUserCustomerSitePosition, updateUserCustomerSiteDimensions, updateUserOnPremisePosition]
+    [updateNodePositions, updateNodeDimensions, customerSiteIds, dxLocationIds, awsContainerIds, userCustomerSiteIds, userOnPremiseIds, updateUserCustomerSitePosition, updateUserCustomerSiteDimensions, updateUserOnPremisePosition]
   );
 
   const getAbsolutePosition = useCallback(
@@ -449,6 +469,25 @@ export function FlowCanvas() {
       }
       dropTargetRef.current = null;
 
+      // Keep the region and AWS boxes around whatever was just moved. The canvas library
+      // grows a parent live while a child is dragged to its edge; this catches what it
+      // cannot, such as a region that grew past the AWS box. Grow only, never shrink.
+      if (!isLocked) {
+        const growth = growContainersToFit(
+          getNodes().map((n) => ({
+            id: n.id,
+            parentId: n.parentId,
+            x: n.position.x,
+            y: n.position.y,
+            width: n.measured?.width ?? (n.width as number | undefined) ?? 0,
+            height: n.measured?.height ?? (n.height as number | undefined) ?? 0,
+          })),
+          draggedNode.parentId,
+          (id) => awsContainerIds.has(id),
+        );
+        if (growth.length > 0) updateNodeDimensions(growth);
+      }
+
       if (!targetId || isLocked || isSimulating) return;
       const category = (draggedNode.data as Record<string, unknown>).category as string;
       if (!LEAF_DROPPABLE_CATEGORIES.has(category)) return;
@@ -493,7 +532,7 @@ export function FlowCanvas() {
         reparentNodeToContainer(nodeId, targetId, { x: finalX, y: finalY });
       });
     },
-    [isLocked, isSimulating, getNode, getNodes, getAbsolutePosition, setNodeSizeOverride, updateNodeDimensions, reparentNodeToContainer],
+    [isLocked, isSimulating, getNode, getNodes, getAbsolutePosition, setNodeSizeOverride, updateNodeDimensions, reparentNodeToContainer, awsContainerIds],
   );
 
   const onReconnect = useCallback(
