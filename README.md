@@ -1,8 +1,18 @@
 # AWS Network Visualizer
 
-Interactive AWS network topology viewer: discover your Direct Connect, Transit Gateway and VPC layout, see resilience gaps, and (planned) trace whether traffic can flow from A to B.
+[![Status](https://img.shields.io/badge/Status-Early_development-orange?style=for-the-badge)](#roadmap)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge)](LICENSE)
 
-> **Status: early work in progress.** Forked from [aws-samples/sample-network-resilience-agent](https://github.com/aws-samples/sample-network-resilience-agent). The Docker image works today. Reachability tracing is planned, not released yet.
+Interactive AWS network topology viewer: discover your VPC, Transit Gateway, VPN and (optionally) Direct Connect layout, see resilience gaps, and (planned) trace whether traffic can flow from A to B.
+
+> **Status: early development, not for production use yet.**
+> Features, interfaces and the Docker image may change without notice, and there are no versioned releases yet. Forked from [aws-samples/sample-network-resilience-agent](https://github.com/aws-samples/sample-network-resilience-agent).
+>
+> **Works today:** demo scenarios, a live read-only view of your account, the Direct Connect switch, an error banner that groups failures by cause, resizable boxes and collapsible long labels.
+>
+> **Planned, not built yet:** the VPC topology map, security-posture checks and reachability tracing (see the [roadmap](#roadmap)).
+>
+> **Before you try it on a real account:** use short-lived, read-only credentials and read the [Security model](#security-model).
 
 ## Quick start (Docker)
 ```
@@ -10,6 +20,8 @@ docker build -f docker/Dockerfile -t aws-network-visualizer .
 docker run --rm -p 127.0.0.1:8080:8080 aws-network-visualizer
 ```
 Open http://localhost:8080 and choose **Use demo data** or **Connect AWS**. The image is about 62 MB, runs as a non-root user, and needs no configuration.
+
+> **About image tags:** there are no releases yet. `aws-network-visualizer` (or `:dev`) is simply what you built last, not a version. Build from a known commit if you need to reproduce a result.
 
 Hardened run (read-only filesystem, no extra privileges):
 ```
@@ -57,10 +69,13 @@ docker build -f docker/Dockerfile --target test .
 - Do not share exported topology snapshots without using the sanitized export.
 
 ## Roadmap
-1. Docker image, runtime configuration, nginx security headers, optional Bedrock (done)
-2. Static reachability trace (A to B): route tables, security groups, NACLs, Transit Gateway, peering, VPN, Direct Connect, internet and NAT gateways, VPC endpoints and Network Firewall. Anything that cannot be evaluated statically is reported as inconclusive, not guessed.
-3. UI/UX settings, reduced motion, optional local cache and restore-last-view
-4. Optional: scan history, VPC Flow Logs analysis
+Item 1 is done; the rest is planned and may change.
+1. **Done:** Docker image, runtime configuration, security headers, optional Bedrock chat, a Direct Connect switch that skips Direct Connect quietly when unavailable, clearer error reporting, resizable boxes
+2. **VPC topology map:** Region > VPC > AZ > subnet, with a detail panel for route tables, security groups and endpoints
+3. **Security posture checks:** open security groups and NACLs, internet-reachable interfaces, blackhole routes, overlapping CIDRs, unused default VPCs, Flow Logs not enabled
+4. **Static reachability trace (A to B):** route tables, security groups, NACLs, Transit Gateway, peering, VPN, Direct Connect, internet and NAT gateways, VPC endpoints and Network Firewall. Anything that cannot be evaluated statically is reported as inconclusive, not guessed
+5. UI/UX settings, reduced motion, optional local cache and restore-last-view
+6. Optional: scan history, VPC Flow Logs analysis
 
 ## Project layout
 ```
