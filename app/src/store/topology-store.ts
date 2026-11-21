@@ -870,6 +870,11 @@ function computeRouteDiffPath(
   return { nodes, edges };
 }
 
+/** Sizes within half a pixel are the same size: the canvas reports measured, fractional values. */
+function sameSize(current: number | undefined, next: number): boolean {
+  return current !== undefined && Math.abs(current - next) < 0.5;
+}
+
 export const useTopologyStore = create<TopologyStore>((set, get) => ({
   credentials: null,
   setCredentials: (creds) => set((state) => ({
@@ -1748,6 +1753,11 @@ export const useTopologyStore = create<TopologyStore>((set, get) => ({
         const next = nodes.map((n) => {
           const ch = changes.find((c) => c.id === n.id);
           if (!ch) return n;
+          // Already this size: leave the node object alone. Replacing it makes the canvas
+          // library re-adopt and re-measure every node, and with `expandParent` it answers
+          // by asking for the same growth again. Applied blindly, that is an endless loop in
+          // which no edge ever finishes drawing.
+          if (sameSize(n.width, ch.width) && sameSize(n.height, ch.height)) return n;
           changed = true;
           return {
             ...n,
