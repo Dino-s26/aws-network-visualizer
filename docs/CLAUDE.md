@@ -12,6 +12,7 @@ A community fork of aws-samples/sample-network-resilience-agent. **Focus: VPC ob
 - `references/` optional, git-ignored local clone of upstream. Never edit, never commit.
 
 ## Commands (run from the project root)
+- Build, test and run in one go (Docker, Podman or nerdctl): `docker/build-image.sh --run` (`--dry-run` prints the commands; `--skip-tests`, `--tag`, `--platform`, `--name`, `--port`)
 - All tests in a container (no local install): `docker build -f docker/Dockerfile --target test .`
 - Production image (also runs tsc): `docker build -f docker/Dockerfile -t aws-network-visualizer:dev .`
 - Run hardened: `docker run -d --name nwv --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true -p 127.0.0.1:8080:8080 aws-network-visualizer:dev`
