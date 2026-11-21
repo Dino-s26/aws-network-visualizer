@@ -16,12 +16,17 @@ str()    { printf '"%s"' "$(clean "$1")"; }
 enabled=false
 [ "$(clean "${BEDROCK_ENABLED:-false}")" = "true" ] && enabled=true
 
+# Direct Connect stays on unless DX_ENABLED is exactly "false"
+dx=true
+[ "$(clean "${DX_ENABLED:-true}")" = "false" ] && dx=false
+
 max_rounds="$(printf '%s' "${MAX_TOOL_ROUNDS:-}" | tr -cd '0-9')"
 : "${max_rounds:=0}"
 
 cat > "$OUT/config.js" <<EOF
 window.__CONFIG__ = {
   bedrockEnabled: $enabled,
+  dxEnabled: $dx,
   bedrockModelId: $(str "${BEDROCK_MODEL_ID:-}"),
   bedrockGuardrailId: $(str "${BEDROCK_GUARDRAIL_ID:-}"),
   bedrockGuardrailVersion: $(str "${BEDROCK_GUARDRAIL_VERSION:-}"),

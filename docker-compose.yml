@@ -16,6 +16,8 @@ services:
     environment:
       # All optional. Bedrock chat stays off unless enabled.
       BEDROCK_ENABLED: "false"
+      # Direct Connect is on by default and skipped automatically if unavailable.
+      # DX_ENABLED: "true"
       # BEDROCK_MODEL_ID: global.anthropic.claude-opus-5
       # BEDROCK_GUARDRAIL_ID: ""
       # BEDROCK_GUARDRAIL_VERSION: DRAFT

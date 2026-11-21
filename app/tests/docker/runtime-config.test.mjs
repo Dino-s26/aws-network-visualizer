@@ -38,6 +38,7 @@ describe('config.js', () => {
     const { cfg } = run();
     expect(cfg).toEqual({
       bedrockEnabled: false,
+      dxEnabled: true,
       bedrockModelId: '',
       bedrockGuardrailId: '',
       bedrockGuardrailVersion: '',
@@ -66,6 +67,13 @@ describe('config.js', () => {
     expect(cfg.defaultScenario).toBe('high');
     expect(cfg.appTitle).toBe('My Network Viz');
     expect(cfg.maxToolRounds).toBe(7);
+  });
+
+  it('keeps Direct Connect on unless DX_ENABLED is exactly "false"', () => {
+    expect(run().cfg.dxEnabled).toBe(true);
+    expect(run({ DX_ENABLED: 'true' }).cfg.dxEnabled).toBe(true);
+    expect(run({ DX_ENABLED: 'false' }).cfg.dxEnabled).toBe(false);
+    expect(run({ DX_ENABLED: '0' }).cfg.dxEnabled).toBe(true);
   });
 
   it('enables Bedrock only for the exact string "true"', () => {

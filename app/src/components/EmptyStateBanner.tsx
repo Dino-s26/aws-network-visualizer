@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useTopologyStore } from '../store/topology-store';
 import { useIsLight } from '../hooks/useTheme';
 import type { TopologyData } from '../types/topology';
+import { dxEmptyStateCopy } from '../api/dx-optional';
 
 // Canvas overlay shown when the active topology has no Direct Connect resources
 // to visualize. Explains that this is expected behavior (not an error) and
@@ -52,6 +53,8 @@ export function EmptyStateBanner({ welcomeDismissed = false }: { welcomeDismisse
     topologyData.customerGateways.length > 0;
   const hasOtherResources =
     topologyData.vpcs.length > 0 || topologyData.transitGateways.length > 0 || hasVpn;
+  // When Direct Connect was turned off or skipped, say so instead of claiming the account has none.
+  const dxCopy = dxEmptyStateCopy(topologyData.dxStatus, hasOtherResources);
 
   return (
     <div
@@ -99,18 +102,21 @@ export function EmptyStateBanner({ welcomeDismissed = false }: { welcomeDismisse
           </svg>
         </div>
         <h2 className={`text-sm font-semibold mb-1.5 ${light ? 'text-slate-800' : 'text-white'}`}>
-          No Direct Connect resources found
+          {dxCopy ? dxCopy.heading : 'No Direct Connect resources found'}
         </h2>
         <p className={`text-xs leading-relaxed ${light ? 'text-slate-500' : 'text-slate-400'}`}>
-          {hasVpn
+          {dxCopy
+            ? dxCopy.body
+            : hasVpn
             ? 'This account connects via Site-to-Site VPN — your VPN connections, Transit Gateways, and VPCs are shown on the canvas, grouped by region. Resources with no attachments appear in the Unattached resources zone.'
             : hasOtherResources
               ? 'This account has no DX connections, virtual interfaces, or DX gateways — any discovered VPCs and Transit Gateways are shown on the canvas, grouped by region. Resources with no attachments appear in the Unattached resources zone.'
               : 'This account has no DX connections, virtual interfaces, or DX gateways.'}
         </p>
         <p className={`text-[11px] mt-2.5 ${light ? 'text-slate-400' : 'text-slate-500'}`}>
-          Sign in to a networking account, or pick a demo scenario from the top bar
-          to explore what a fully-configured topology looks like.
+          {dxCopy
+            ? dxCopy.hint
+            : 'Sign in to a networking account, or pick a demo scenario from the top bar to explore what a fully-configured topology looks like.'}
         </p>
       </div>
     </div>

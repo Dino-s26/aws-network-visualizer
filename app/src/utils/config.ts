@@ -13,6 +13,9 @@ export const config = {
   /** Amazon Bedrock chat. Off unless enabled at runtime or build time. */
   bedrockEnabled: rt.bedrockEnabled ?? env.VITE_BEDROCK_ENABLED === 'true',
 
+  /** Direct Connect view. On by default; skipped automatically when unavailable. Only the exact value false turns it off. */
+  dxEnabled: rt.dxEnabled ?? env.VITE_DX_ENABLED !== 'false',
+
   /** Bedrock model ID (without cross-region prefix). */
   bedrockModelId: rt.bedrockModelId || env.VITE_BEDROCK_MODEL_ID || 'global.anthropic.claude-opus-5',
 
@@ -26,7 +29,7 @@ export const config = {
   defaultScenario: (rt.defaultScenario || env.VITE_DEFAULT_SCENARIO || 'noResiliency') as MockScenario,
 
   /** App title shown in the top bar. */
-  appTitle: rt.appTitle || env.VITE_APP_TITLE || 'Network Resilience Agent',
+  appTitle: rt.appTitle || env.VITE_APP_TITLE || 'AWS Network Visualizer',
 
   /** Bedrock Guardrail identifier (created in the Bedrock console). */
   bedrockGuardrailId: rt.bedrockGuardrailId || env.VITE_BEDROCK_GUARDRAIL_ID || '',

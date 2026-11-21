@@ -4,6 +4,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 // Each test sets its inputs, clears the module cache, then imports a fresh copy.
 const ENV_KEYS = [
   'VITE_BEDROCK_ENABLED',
+  'VITE_DX_ENABLED',
   'VITE_BEDROCK_MODEL_ID',
   'VITE_DEFAULT_REGION',
   'VITE_MAX_TOOL_ROUNDS',
@@ -33,11 +34,12 @@ describe('config defaults', () => {
     expect(typeof window).toBe('undefined');
     const c = await loadConfig();
     expect(c.bedrockEnabled).toBe(false);
+    expect(c.dxEnabled).toBe(true);
     expect(c.bedrockModelId).toBe('global.anthropic.claude-opus-5');
     expect(c.defaultRegion).toBe('us-east-1');
     expect(c.maxToolRounds).toBe(5);
     expect(c.defaultScenario).toBe('noResiliency');
-    expect(c.appTitle).toBe('Network Resilience Agent');
+    expect(c.appTitle).toBe('AWS Network Visualizer');
     expect(c.bedrockGuardrailId).toBe('');
     expect(c.bedrockGuardrailVersion).toBe('DRAFT');
     expect(c.ssoBackendUrl).toBe('');
@@ -81,7 +83,7 @@ describe('config precedence', () => {
       },
     });
     expect(c.defaultRegion).toBe('eu-west-1');
-    expect(c.appTitle).toBe('Network Resilience Agent');
+    expect(c.appTitle).toBe('AWS Network Visualizer');
     expect(c.bedrockModelId).toBe('global.anthropic.claude-opus-5');
     expect(c.bedrockGuardrailVersion).toBe('DRAFT');
     expect(c.ssoBackendUrl).toBe('');
@@ -120,5 +122,22 @@ describe('maxToolRounds', () => {
 
   it('ignores a non-numeric build-time value', async () => {
     expect((await loadConfig({ env: { VITE_MAX_TOOL_ROUNDS: 'abc' } })).maxToolRounds).toBe(5);
+  });
+});
+
+describe('dxEnabled', () => {
+  it('is on by default', async () => {
+    expect((await loadConfig()).dxEnabled).toBe(true);
+  });
+
+  it('turns off only for the exact string "false" in the build-time env', async () => {
+    expect((await loadConfig({ env: { VITE_DX_ENABLED: 'false' } })).dxEnabled).toBe(false);
+    expect((await loadConfig({ env: { VITE_DX_ENABLED: '0' } })).dxEnabled).toBe(true);
+    expect((await loadConfig({ env: { VITE_DX_ENABLED: 'FALSE' } })).dxEnabled).toBe(true);
+  });
+
+  it('lets an explicit runtime value beat the build-time env, in both directions', async () => {
+    expect((await loadConfig({ env: { VITE_DX_ENABLED: 'true' }, runtime: { dxEnabled: false } })).dxEnabled).toBe(false);
+    expect((await loadConfig({ env: { VITE_DX_ENABLED: 'false' }, runtime: { dxEnabled: true } })).dxEnabled).toBe(true);
   });
 });
