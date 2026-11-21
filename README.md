@@ -17,6 +17,16 @@ docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
   --security-opt no-new-privileges:true -p 127.0.0.1:8080:8080 aws-network-visualizer
 ```
 
+## Build script
+`docker/build-image.sh` does the build for you: it runs the unit tests in a container, builds the image, and with `--run` starts it hardened on `127.0.0.1:8080` and waits until it answers. It works with Docker, Podman or nerdctl (for example Colima), picked with `--engine` or `$CONTAINER_ENGINE`, otherwise the first one found.
+```
+docker/build-image.sh                 # tests, then build
+docker/build-image.sh --run           # ... then start it
+docker/build-image.sh --skip-tests --run --name nwv --port 8080
+docker/build-image.sh --dry-run       # print the commands, run nothing
+```
+Other options: `--tag NAME:TAG`, `--no-cache`, `--platform linux/amd64`. A second tag with the git commit is added automatically. `--run` replaces a container with the same `--name`.
+
 ## Configuration (all optional, set with `-e NAME=value`)
 | Variable | Default | Purpose |
 |---|---|---|
