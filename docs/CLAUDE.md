@@ -30,7 +30,7 @@ A community fork of aws-samples/sample-network-resilience-agent. **Focus: VPC ob
 - No PII or sensitive client data. Never write real account IDs, resource IDs, local usernames or local paths into the repo, docs, tests or checkpoints. Confirm information before processing it.
 - Ask about the end goal and propose a plan before acting.
 - Before any terminal or MCP call: say what runs and the impact. Ask before installs, builds that start containers, deletions, commits, pushes.
-- Checkpoint every 2-4 operations by appending to docs/checkpoint.md.
+- Checkpoint every 2-4 operations by adding a new entry at the TOP of docs/checkpoint.md (newest first, numbered one higher; see the note at the top of that file).
 - The user runs git commits and pushes unless they explicitly delegate. Branch names: `feat/xxx`.
 - Keep answers short and token-efficient.
 
